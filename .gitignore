@@ -1,0 +1,20 @@
+# 依赖
+node_modules/
+
+# 生成产物（bench 跑图输出）与临时文件
+bench/results/
+.screenshots/
+.trae-html-share-packages/
+*.log
+*.tmp
+Thumbs.db
+.DS_Store
+
+# 本地 IDE / 个人配置
+.trae/
+
+# 密钥与个人环境变量
+.env
+.env.*
+*.pem
+*.key

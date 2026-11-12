@@ -1,0 +1,10 @@
+{
+  "name": "pindou-mobile",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "拼豆移动端 H5：照片转图纸、双指缩放查看、进度勾选、用量与缺色提示",
+  "scripts": {
+    "start": "node server.mjs"
+  }
+}
