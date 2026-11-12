@@ -125,6 +125,13 @@ for (const config of CONFIGS) {
   );
 }
 
+// 比例断言：网格行列、取景、缩略图、导出画布都必须等比，失败会在这里直接暴露。
+const aspect = runAspectChecks({ quiet: true });
+console.log(
+  `\n比例断言：${aspect.passed}/${aspect.passed + aspect.failed} 通过` +
+    (aspect.failed ? '（有失败，运行 node bench/aspect-check.mjs 查看详情）' : ''),
+);
+
 /* ---------------- 背景处理：保留 vs 去除，两组口径分开看 ---------------- */
 
 // 教训：只用「背景去得干不干净」判断好坏，会把「用户本来想保留天空」的图纸判成满分。
@@ -194,3 +201,7 @@ writeFileSync(
       background: backgroundRows,
     },
     null,
+    2,
+  ),
+);
+console.log(`\n已写入 ${target}`);

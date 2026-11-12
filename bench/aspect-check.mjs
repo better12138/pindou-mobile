@@ -164,12 +164,12 @@ export function runAspectChecks({ quiet = false, writeReport = false } = {}) {
     thumbBlock.replace(/\s+/g, ' ').trim() || '未找到 .project-thumb',
   );
   const printTable = cssBlock('.print-table');
-  const printCell = cssBlock('.print-table th, .print-table td');
+  const printCell = (CSS.match(/\.print-table th,\s*\.print-table td\s*\{([^}]*)\}/) || [])[1] || '';
   check(
     '打印格子',
     '宽高同取 --cell',
     /width:\s*var\(--cell\)/.test(printCell) && /height:\s*var\(--cell\)/.test(printCell) && /var\(--cell\)/.test(printTable),
-    printCell.replace(/\s+/g, ' ').trim(),
+    printCell.replace(/\s+/g, ' ').trim() || '未找到打印格子样式',
   );
 
   const passed = checks.filter((item) => item.ok).length;

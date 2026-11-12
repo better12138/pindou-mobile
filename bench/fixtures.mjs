@@ -214,12 +214,14 @@ function shapeScene(width, height) {
   });
 }
 
-/** 正方形 / 竖图 / 横图 / 超宽图，尺寸固定、可复跑。 */
+/** 正方形 / 竖图 / 横图 / 超宽图 / 超高图，尺寸固定、可复跑。 */
 export function shapeFixtures() {
   return [
     { name: 'shape-square', ...shapeScene(600, 600) },
     { name: 'shape-portrait', ...shapeScene(600, 900) },
     { name: 'shape-landscape', ...shapeScene(900, 600) },
     { name: 'shape-ultrawide', ...shapeScene(1600, 300) },
+    // 3:16 的超高图用于暴露导出画布高度被 12000 截断的问题。
+    { name: 'shape-tall', ...shapeScene(300, 1600) },
   ];
 }

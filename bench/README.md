@@ -10,6 +10,7 @@ node bench/run.mjs          # 主基准：9 张固定图 × 卡通/写实 × 旧
 node bench/visual-report.mjs before            # 观感/边缘专项：9 图 + 熊图，原图|结果 对比图 + visual-before.json
 node bench/visual-report.mjs --combine before after  # 输出「原图 | 改前 | 改后」三联图
 node bench/edge-report.mjs now                 # 边缘专项：去背景模式「原图 | 旧版 | 新版」+ edge-now.json
+node bench/aspect-check.mjs                    # 长宽比例：5 种比例 × 3 种宽度 × 2 种色数，断言不通过会退出码 1
 node bench/bear-diagnose.mjs [before|after]     # 真实照片回归样本：加 tag 输出两套图，便于前后对比
 node bench/match-bench.mjs  # 色号匹配：真实色板命中率与耗时
 node bench/gen-bluenoise.mjs # 重新生成 js/bluenoise.js（蓝噪声阈值矩阵，结果确定）
@@ -17,6 +18,8 @@ node bench/gen-bluenoise.mjs # 重新生成 js/bluenoise.js（蓝噪声阈值矩
 
 `bench/legacy-convert.js` 是改造前 `js/convert.js` 的冻结副本（只改了 import 路径），
 **不要修改**，否则基线失效。`bench/png.mjs` 是零依赖 PNG 读写，给 Node 侧读图/写对比图用。
+`visual-report.mjs` 的 `before` tag 固定走这个冻结副本，`after`/其它 tag 走当前版本——
+否则「改前」只是把现在的图再输出一遍，对比没有意义。
 
 ## 固定图集（bench/fixtures.mjs）
 
@@ -33,6 +36,9 @@ node bench/gen-bluenoise.mjs # 重新生成 js/bluenoise.js（蓝噪声阈值矩
 | product | 米白背景 + 竖向打光 + 柔和阴影 | 浅色背景误判 |
 | photo-mix | 绿色虚化背景 + 皮肤 + 衣物 + 噪点 | 最接近手机实拍 |
 | photo-bear | 1236×1236 实拍：浅蓝渐变天空 + 米白卡通主体 + 黑色描边 + 深色西装 | 浅色主体误判、背景残留、描边脏色（`bench/fixtures/bear-photo.jpg` 为原图） |
+
+另有 `shapeFixtures()`：600×600 / 600×900 / 900×600 / 1600×300 / 300×1600，同一构图（圆 + 十字线 +
+上下分色带），圆一旦被非等比缩放就会变成椭圆，用于长宽比例断言与目视复核。
 
 ## 指标（bench/metrics.mjs）
 
@@ -259,6 +265,35 @@ bench 同图同参数跑两遍，两组分别记指标：
   `logo` 甚至会出现 0.000 但渲染完整的情况。边缘召回以保留背景口径为准（全部 1.000，
   仅 `portrait` 0.966 是观感专项压平软过渡的代价）。
 - 去背景模式耗时没变差：白熊图 1295ms（旧版）→ 618ms（新版，含整格扫描）。
+
+## 长宽比例专项
+
+用户反馈「生成结果长宽不一致」。实测结论：**转换算法本身没有问题**——源比例到网格高度按
+`round(源高/源宽 × 设定宽度)` 换算，`viewer` 取景、裁剪、Worker 回传也都等比；不一致来自展示和导出两处：
+
+1. **缩略图被裁成方形**：`.project-thumb` 是 64×64 + `object-fit: cover`，竖图/横图只显示中间一块，
+   卡片上的长宽比和图纸对不上。改为 `contain`：完整显示、两侧留白。
+2. **导出画布宽高分别截断**：`export.js` 原来对 `canvas.width/height` 各自 `Math.min(12000, …)`，
+   超高图（110×587）底部约 1124px 连同整个图例被裁掉；而且没有面积上限，iOS Safari 超过约
+   16.7M 像素会导出空白图。改为 `chartLayout()` 先算布局，再用**同一个缩放因子**同时收缩格子
+   （`MAX_SIDE=12000`、`MAX_AREA=16M`），宽高比严格不变。
+3. **高度取整**是唯一剩下的误差：`round()` 最多差 0.5 格，属于像素网格的必然结果，不是拉伸。
+
+自动化断言 `node bench/aspect-check.mjs`（5 种比例 × 宽度 16/48/110 × 16/40 色，共 62 项全过）：
+网格行列 = `round(源高/源宽 × 宽度)` 且误差 ≤1 格；`computeFit` 单一 scale 且居中；`thumbSize`
+比例误差 <1px；`chartLayout` 两轴同格、画布不超限；CSS 缩略图 `contain`、打印格子宽高同取 `--cell`。
+
+| 形状 | 源尺寸 | 网格 | 导出画布 | 格子 px |
+| --- | --- | --- | --- | --- |
+| 正方形 | 600×600 | 110×110 | 2492×2630 | 22.00×22.00 |
+| 竖图 | 600×900 | 110×165 | 2492×3866 | 22.00×22.00 |
+| 横图 | 900×600 | 110×73 | 2492×1842 | 22.00×22.00 |
+| 超宽图 | 1600×300 | 110×21 | 2492×672 | 22.00×22.00 |
+| 超高图 | 300×1600 | 110×587 | 1722×9015（旧版完整需 13124，会被裁） | 15.00×15.00 |
+
+对比图：`bench/results/aspect-<形状>-ab.png`（原图 | 旧版 | 现在）。DOM 实测（临时自检页）：
+canvas CSS 320×420、像素 320×420、像素/CSS `1.000 / 1.000`、取景 scale 2.400（格 2.40×2.40），
+180×270 的缩略图在 64px 框内两侧留白、不裁切。
 
 ## 已知取舍
 

@@ -9,6 +9,7 @@ import { decodePng, encodePng, resizeNearest, sideBySide } from './png.mjs';
 import { buildFixtures, photoFixtures } from './fixtures.mjs';
 import { evaluate } from './metrics.mjs';
 import { convertToBeads } from '../js/convert.js';
+import { convertToBeads as convertLegacy } from './legacy-convert.js';
 import { colorOf } from '../js/palette.js';
 
 const directory = fileURLToPath(new URL('./results/', import.meta.url));
@@ -63,12 +64,14 @@ if (process.argv[2] === '--combine') {
   console.log(`已输出 ${fixtures.length} 张「原图 | 改前 | 改后」对比图到 ${directory}`);
 } else {
   const tag = (process.argv[2] || 'current').trim();
+  // before 必须走冻结的旧版，否则「改前」只是把现在的图再输出一遍，对比失去意义。
+  const convert = tag === 'before' ? convertLegacy : convertToBeads;
   const rows = [];
   console.log(`== ${tag}：110 格 / 40 色 / 保留背景 ==`);
   console.log('图片            ΔE00 孤立豆% 台阶/千 最大台阶 细线断% 线同位% 边缘r 用时ms');
   for (const fixture of fixtures) {
     const started = performance.now();
-    const result = convertToBeads(fixture, { ...CONFIG });
+    const result = convert(fixture, { ...CONFIG });
     const elapsed = performance.now() - started;
     const metrics = evaluate(fixture, result);
     writeFileSync(`${directory}${fixture.name}-result-${tag}.png`, encodePng(renderGrid(result)));

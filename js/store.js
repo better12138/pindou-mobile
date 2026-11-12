@@ -395,9 +395,12 @@ function writeAllToLocalStorage() {
 }
 
 // 页面隐藏时尽力落盘（异步请求可能被系统中断，但 IndexedDB 事务通常会完成）。
-window.addEventListener('pagehide', () => {
-  flushStore();
-});
+// Node 下没有 window（bench 会 import 本模块校验缩略图比例），跳过即可。
+if (typeof window !== 'undefined') {
+  window.addEventListener('pagehide', () => {
+    flushStore();
+  });
+}
 
 /* ---------------- 工具 ---------------- */
 
