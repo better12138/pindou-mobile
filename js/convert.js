@@ -1,5 +1,5 @@
 // 图片 → 拼豆格子。移植自拼豆 PC 项目（MIT），去掉分层/画板边界等桌面端概念。
-import { colorDistance, colorDistanceLab, labDistance, palettes } from './palette.js';
+import { colorDistance, colorDistanceLab, getColor, labDistance, palettes } from './palette.js';
 import { createMatcher, getMatcher } from './color-match.js';
 import { blueNoiseThresholds } from './bluenoise.js';
 
@@ -25,6 +25,13 @@ const styleProfiles = {
 };
 
 export const MAX_SOURCE_SIDE = 1600;
+
+// 小特征实体化用的工作分辨率：长边超过这个值就降采样，内存/耗时可控，
+// 同时 2~4px 的高光在低格数（16~48 格）下仍然能落进至少一个工作像素。
+const ENTITY_MAX_SIDE = 720;
+// 实体与包围环的平均亮度差（luma）：低于这个值只是同一块区域的明暗过渡，
+// 不值得为它把整格改成另一种豆。
+const ENTITY_CONTRAST = 40;
 
 /** 把任意来源图片画到受尺寸限制的离屏画布，移动端读取像素更快。 */
 export function prepareSource(source) {
@@ -76,9 +83,11 @@ export function convertToBeads(source, options) {
   const gridHeight = Math.max(1, Math.round((source.height / source.width) * gridWidth));
   // 背景必须是「和画面边缘连通」的那一片：主体内部恰好同色的区域（白衬衫、反光）不会被挖空。
   // 保留背景时也要算：它不用于剔除，只用于识别「亮点是白底还是主体内部的高光」。
+  // 只有去背景或需要亮特征（卡通）时才建 mask，写实 + 保留背景不付这份内存/耗时。
   const removingBackground = normalized.backgroundMode !== 'keep';
-  const backgroundModel = buildBackgroundModel(source, background.centers);
-  const backgroundMask = backgroundModel.mask;
+  const backgroundModel =
+    removingBackground || profile.lightFeature ? buildBackgroundModel(source, background.centers) : null;
+  const backgroundMask = backgroundModel?.mask || null;
   clock('background');
   const sampled = sampleGridCells(
     source,
@@ -86,12 +95,16 @@ export function convertToBeads(source, options) {
     gridHeight,
     normalized,
     backgroundMask,
-    backgroundModel.confidence,
+    backgroundModel?.confidence || null,
     profile,
     speckleStrength,
     removingBackground,
   );
   clock('sample');
+  // 小特征实体化：低格数下高光/瞳孔可能不足 1 格，格内采样抓不稳，
+  // 先在源像素上定位紧凑亮块/暗块，再把结果挂到覆盖率最高的格子。
+  attachFeatureEntities(sampled, source, gridWidth, gridHeight, backgroundMask, profile);
+  clock('entities');
   // 目标色只算一次：选色直方图和最终上色共用，避免同一格用两套颜色判断。
   // 平滑格直接用已算好的格内平均色，跳过聚类（聚类只在描边/细节格有意义，且是热路径大头）；
   // 但去背景模式下的剔除条件要照旧生效，否则纯背景格会被当成主体排上珠子。
@@ -134,6 +147,10 @@ export function convertToBeads(source, options) {
   const merged = mergeSimilarColors(cells, gridWidth, gridHeight, speckleStrength, candidates, sampled);
   const compact = reduceTinyRegions(merged, gridWidth, gridHeight, speckleStrength, candidates, sampled);
   const reduced = reduceSpeckles(compact, gridWidth, gridHeight, speckleStrength, candidates, sampled);
+  let smoothStepChanges = 0;
+  if (ditherMode === 'none') {
+    smoothStepChanges = relieveSmoothSteps(reduced, sampled, targetGrid, gridWidth, gridHeight);
+  }
   const used = reduced.filter(Boolean);
   clock('cleanup');
   if (timings) timings.total = Math.round(nowMs() - clock.start);
@@ -144,8 +161,15 @@ export function convertToBeads(source, options) {
     cells: reduced,
     colorsUsed: new Set(used).size,
     totalBeads: used.length,
-    // 仅 bench 诊断时回传背景模型，普通调用不增加字段。
-    ...(options.debug ? { background } : null),
+    // 仅 bench 诊断时回传中间结果（背景模型、实体格数量、采样/目标色/候选色板），
+    // 普通调用不增加字段，也不改变任何输出。
+    ...(options.debug
+      ? {
+          background,
+          entityCells: sampled.filter((cell) => cell.entityFeature).length,
+          stages: { sampled, targets: targetGrid, candidates, smoothStepChanges },
+        }
+      : null),
   };
 }
 
@@ -249,6 +273,12 @@ function sampleGridCells(
       cells.push({
         samples: sampled.samples,
         sampleBackground: sampled.sampleBackground,
+        sampleSx: sampled.sampleSx,
+        sampleSy: sampled.sampleSy,
+        // 每个采样点之间的源图像素距离：亮特征用它区分「真高光」和「1~2px 的抗锯齿亮点」。
+        sampleStep: source.width / width / profile.sampleSide,
+        // 保留背景模式：亮特征只在「本来就以暗色为主」的格子里生效（见 minorityLightFeatureRgb）。
+        backgroundKept: !removingBackground,
         average: sampled.average,
         backgroundShare: sampled.backgroundShare,
         backgroundConfidence: sampled.backgroundConfidence,
@@ -284,6 +314,329 @@ function sampleGridCells(
     markDarkThicknessCells(cells, width, height);
   }
   return cells;
+}
+
+/**
+ * 小特征实体化（P1）：在「工作分辨率」上做连通域，找出紧凑的亮块/暗块
+ * （高光、眼白、瞳孔、小暗点），再映射到覆盖率最高的格子。
+ *
+ * 为什么不能只靠格内采样：低格数时一颗高光往往只有 0.1~0.3 格，格内 5×7 个采样点
+ * 要么整格漏掉，要么只命中 1~2 个点、过不了「成块」判据；而格子平均色又会被周边
+ * 暗部吃掉。连通域直接在源像素上量面积/致密度/包围环对比，不受格内采样密度影响。
+ *
+ * 只给卡通风格开启：写实图的高光/噪点碎屑本身就是大面积细碎特征，实体化会把它们
+ * 当成必须保留的细节，反而改变写实基线。
+ */
+function attachFeatureEntities(cells, source, gridWidth, gridHeight, backgroundMask, profile) {
+  if (!profile.lightFeature) return;
+  const work = buildFeatureWorkBuffer(source, backgroundMask);
+  const cellWidth = work.width / gridWidth;
+  const cellHeight = work.height / gridHeight;
+  // 种子必须按「局部对比」而不是全局亮度：二次元的眼白往往直接贴着肤色，
+  // 用全局阈值会把高光、眼白、皮肤连成一个巨大的亮块，小高光反而被这个
+  // 大块吞掉（面积超限整块被放弃）。取约 1.2 格半径的环形邻域作参照，
+  // 只有明显亮于/暗于周围一圈的像素才是特征种子。
+  const radius = Math.min(96, Math.max(5, Math.round(Math.min(cellWidth, cellHeight) * 1.2)));
+  const localMean = buildLocalMean(work, radius);
+  const entities = [
+    ...collectFeatureEntities(work, localMean, 'light', cellWidth, cellHeight, gridWidth, gridHeight),
+    ...collectFeatureEntities(work, localMean, 'dark', cellWidth, cellHeight, gridWidth, gridHeight),
+  ];
+  // 同一格可能有多个候选（高光与瞳孔同格）：留分高的那个，另一个交给现有
+  // 逐格最近色/暗色升格兜底。排序必须稳定（分数相同按格号）才能保证确定性。
+  entities.sort((a, b) => b.score - a.score || a.cell - b.cell);
+  const assigned = new Set();
+  for (const entity of entities) {
+    if (assigned.has(entity.cell)) continue;
+    const cell = cells[entity.cell];
+    if (!cell || !cell.average) continue;
+    // 贴着背景的格子不升格：那一角很可能是压在轮廓上的白底/过渡像素。
+    if (cell.backgroundShare > (entity.type === 'light' ? 0.35 : 0.5)) continue;
+    // 只用实体去补「格内采样本来读不出来」的特征：
+    // 暗块落在本来就以暗色为主的格子里，逐格采样已经能上对色；暗块在格内连
+    // 2% 的采样都占不到，说明它小到不构成这个格子的主体，硬涂成暗色就是凭空
+    // 多一颗黑豆（典型：瞳孔把同一格里的高光挤掉、浅色格出现黑点）。
+    if (entity.type === 'dark' && (cell.darkShare >= 0.3 || cell.darkShare < 0.02)) continue;
+    assigned.add(entity.cell);
+    cell.entityFeature = entity;
+  }
+}
+
+/**
+ * 特征实体用的工作分辨率缓冲：长边 ≤720，每个工作像素保存该源像素块的
+ * 平均亮度（用于包围环对比）以及最亮/最暗像素的颜色（用于实体取色，
+ * 避免块内抗锯齿把高光/瞳孔染成灰）。
+ */
+function buildFeatureWorkBuffer(source, backgroundMask) {
+  const { data, width, height } = source;
+  const scale = Math.min(1, ENTITY_MAX_SIDE / Math.max(width, height));
+  const workWidth = Math.max(1, Math.round(width * scale));
+  const workHeight = Math.max(1, Math.round(height * scale));
+  const total = workWidth * workHeight;
+  const mean = new Uint8Array(total);
+  const bg = new Uint8Array(total);
+  const lightLum = new Uint8Array(total);
+  const lightR = new Uint8Array(total);
+  const lightG = new Uint8Array(total);
+  const lightB = new Uint8Array(total);
+  const darkLum = new Uint8Array(total).fill(255);
+  const darkR = new Uint8Array(total);
+  const darkG = new Uint8Array(total);
+  const darkB = new Uint8Array(total);
+  for (let wy = 0; wy < workHeight; wy += 1) {
+    const y0 = Math.floor((wy / workHeight) * height);
+    const y1 = Math.max(y0 + 1, Math.floor(((wy + 1) / workHeight) * height));
+    for (let wx = 0; wx < workWidth; wx += 1) {
+      const x0 = Math.floor((wx / workWidth) * width);
+      const x1 = Math.max(x0 + 1, Math.floor(((wx + 1) / workWidth) * width));
+      let sum = 0;
+      let count = 0;
+      let foreground = 0;
+      let backgroundCount = 0;
+      let maxLum = -1;
+      let minLum = 256;
+      let maxIndex = -1;
+      let minIndex = -1;
+      for (let y = y0; y < y1; y += 1) {
+        for (let x = x0; x < x1; x += 1) {
+          const index = (y * width + x) * 4;
+          count += 1;
+          if (data[index + 3] < 24 || (backgroundMask !== null && backgroundMask[y * width + x] === 1)) {
+            backgroundCount += 1;
+            continue;
+          }
+          foreground += 1;
+          const value = 0.299 * data[index] + 0.587 * data[index + 1] + 0.114 * data[index + 2];
+          sum += value;
+          if (value > maxLum) {
+            maxLum = value;
+            maxIndex = index;
+          }
+          if (value < minLum) {
+            minLum = value;
+            minIndex = index;
+          }
+        }
+      }
+      const offset = wy * workWidth + wx;
+      mean[offset] = foreground > 0 ? Math.round(sum / foreground) : 0;
+      bg[offset] = count > 0 && backgroundCount * 2 > count ? 1 : 0;
+      if (maxIndex >= 0) {
+        lightLum[offset] = Math.round(maxLum);
+        lightR[offset] = data[maxIndex];
+        lightG[offset] = data[maxIndex + 1];
+        lightB[offset] = data[maxIndex + 2];
+      }
+      if (minIndex >= 0) {
+        darkLum[offset] = Math.round(minLum);
+        darkR[offset] = data[minIndex];
+        darkG[offset] = data[minIndex + 1];
+        darkB[offset] = data[minIndex + 2];
+      }
+    }
+  }
+  const stride = workWidth + 1;
+  const satLum = new Int32Array(stride * (workHeight + 1));
+  const satBg = new Int32Array(stride * (workHeight + 1));
+  for (let y = 0; y < workHeight; y += 1) {
+    let rowLum = 0;
+    let rowBg = 0;
+    for (let x = 0; x < workWidth; x += 1) {
+      const offset = y * workWidth + x;
+      rowLum += mean[offset];
+      rowBg += bg[offset];
+      satLum[(y + 1) * stride + x + 1] = satLum[y * stride + x + 1] + rowLum;
+      satBg[(y + 1) * stride + x + 1] = satBg[y * stride + x + 1] + rowBg;
+    }
+  }
+  return {
+    width: workWidth,
+    height: workHeight,
+    scale,
+    total,
+    mean,
+    bg,
+    satLum,
+    satBg,
+    light: { lum: lightLum, r: lightR, g: lightG, b: lightB },
+    dark: { lum: darkLum, r: darkR, g: darkG, b: darkB },
+  };
+}
+
+/** 半开区间 [x0,x1) × [y0,y1) 的积分图求和。 */
+function rectangleSum(sat, stride, x0, y0, x1, y1) {
+  return sat[y1 * stride + x1] - sat[y0 * stride + x1] - sat[y1 * stride + x0] + sat[y0 * stride + x0];
+}
+
+/**
+ * 每个工作像素的「环形邻域平均亮度」：外半径 radius 的方框减去内半径 0.45×radius 的方框。
+ * 减掉内圈是为了不让自己（特征本体）把参照亮度抬高，否则大高光会把自己算成“周围也亮”。
+ */
+function buildLocalMean(work, radius) {
+  const { width, height, mean, satLum } = work;
+  const stride = width + 1;
+  const inner = Math.max(1, Math.round(radius * 0.45));
+  const result = new Float32Array(width * height);
+  for (let y = 0; y < height; y += 1) {
+    const y0 = Math.max(0, y - radius);
+    const y1 = Math.min(height, y + radius + 1);
+    const iy0 = Math.max(0, y - inner);
+    const iy1 = Math.min(height, y + inner + 1);
+    for (let x = 0; x < width; x += 1) {
+      const x0 = Math.max(0, x - radius);
+      const x1 = Math.min(width, x + radius + 1);
+      const ix0 = Math.max(0, x - inner);
+      const ix1 = Math.min(width, x + inner + 1);
+      const count = (x1 - x0) * (y1 - y0) - (ix1 - ix0) * (iy1 - iy0);
+      if (count <= 0) {
+        result[y * width + x] = mean[y * width + x];
+        continue;
+      }
+      const sum =
+        rectangleSum(satLum, stride, x0, y0, x1, y1) - rectangleSum(satLum, stride, ix0, iy0, ix1, iy1);
+      result[y * width + x] = sum / count;
+    }
+  }
+  return result;
+}
+
+/**
+ * 提取某一类（light/dark）的紧凑实心块，并映射到覆盖率最高的格子。
+ *
+ * 判据全部是结构性量，不对应具体图像内容：
+ * - 种子：比环形邻域平均亮度亮 60 / 暗 45 以上（局部对比，避免和成片同色区粘连）；
+ * - 面积：≥3 源像素等效边长（滤掉抗锯齿单点），≤6 格（更大的区域走正常取色）；
+ * - 致密度 area/bbox：实心块 0.5 以上，细线/描边只有 0.1~0.3；
+ * - 包围环对比：块与周围一圈的平均亮度差 ≥40，排除大块同色区域内部；
+ * - 亮块还要求包围环里背景占比 <45%，排除压在白底/轮廓上的抗锯齿过渡。
+ */
+function collectFeatureEntities(work, localMean, type, cellWidth, cellHeight, gridWidth, gridHeight) {
+  const { width, height, total, bg, mean, satLum, satBg, scale } = work;
+  const stride = width + 1;
+  const plane = type === 'light' ? work.light : work.dark;
+  const cellArea = Math.max(1, cellWidth * cellHeight);
+  const minArea = Math.max(6, Math.round(12 * scale * scale));
+  const maxArea = cellArea * 6;
+  const minCompactness = type === 'light' ? 0.5 : 0.45;
+  const isSeed = (index) => {
+    if (bg[index]) return false;
+    const value = plane.lum[index];
+    return type === 'light'
+      ? value >= 90 && value - localMean[index] >= 60
+      : value <= 100 && localMean[index] - value >= 45;
+  };
+  const visited = new Uint8Array(total);
+  const queue = new Int32Array(total);
+  const counts = new Int32Array(gridWidth * gridHeight);
+  const touched = [];
+  const entities = [];
+  const resetCounts = () => {
+    for (const index of touched) counts[index] = 0;
+    touched.length = 0;
+  };
+  for (let start = 0; start < total; start += 1) {
+    if (visited[start] || !isSeed(start)) continue;
+    let head = 0;
+    let tail = 1;
+    queue[0] = start;
+    visited[start] = 1;
+    let area = 0;
+    let sumR = 0;
+    let sumG = 0;
+    let sumB = 0;
+    let sumLum = 0;
+    let minX = width;
+    let maxX = -1;
+    let minY = height;
+    let maxY = -1;
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const px = index % width;
+      const py = (index - px) / width;
+      area += 1;
+      sumR += plane.r[index];
+      sumG += plane.g[index];
+      sumB += plane.b[index];
+      sumLum += mean[index];
+      if (px < minX) minX = px;
+      if (px > maxX) maxX = px;
+      if (py < minY) minY = py;
+      if (py > maxY) maxY = py;
+      const gx = Math.min(gridWidth - 1, Math.floor((px + 0.5) / cellWidth));
+      const gy = Math.min(gridHeight - 1, Math.floor((py + 0.5) / cellHeight));
+      const cellIndex = gy * gridWidth + gx;
+      if (counts[cellIndex] === 0) touched.push(cellIndex);
+      counts[cellIndex] += 1;
+      for (let d = 0; d < 4; d += 1) {
+        const nx = px + NEIGHBOR_OFFSETS[d][0];
+        const ny = py + NEIGHBOR_OFFSETS[d][1];
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const next = ny * width + nx;
+        if (visited[next] || !isSeed(next)) continue;
+        visited[next] = 1;
+        queue[tail] = next;
+        tail += 1;
+      }
+    }
+    let cellIndex = -1;
+    let coverage = 0;
+    for (const index of touched) {
+      if (counts[index] > coverage) {
+        coverage = counts[index];
+        cellIndex = index;
+      }
+    }
+    const boxWidth = maxX - minX + 1;
+    const boxHeight = maxY - minY + 1;
+    const bboxArea = boxWidth * boxHeight;
+    const compactness = bboxArea > 0 ? area / bboxArea : 0;
+    const areaCells = area / cellArea;
+    let keep = area >= minArea && area <= maxArea && compactness >= minCompactness;
+    if (keep) {
+      const pad = Math.max(2, Math.round(Math.min(cellWidth, cellHeight) * 0.18));
+      const x0 = Math.max(0, minX - pad);
+      const y0 = Math.max(0, minY - pad);
+      const x1 = Math.min(width, maxX + 1 + pad);
+      const y1 = Math.min(height, maxY + 1 + pad);
+      const ringCount = (x1 - x0) * (y1 - y0) - bboxArea;
+      if (ringCount <= 0) {
+        keep = false;
+      } else {
+        const ringLum =
+          (rectangleSum(satLum, stride, x0, y0, x1, y1) -
+            rectangleSum(satLum, stride, minX, minY, maxX + 1, maxY + 1)) /
+          ringCount;
+        const coreLum = sumLum / area;
+        const contrast = type === 'light' ? coreLum - ringLum : ringLum - coreLum;
+        let ringBg = 0;
+        if (type === 'light') {
+          ringBg =
+            (rectangleSum(satBg, stride, x0, y0, x1, y1) -
+              rectangleSum(satBg, stride, minX, minY, maxX + 1, maxY + 1)) /
+            ringCount;
+        }
+        if (contrast < ENTITY_CONTRAST) {
+          keep = false;
+        } else if (type === 'light') {
+          if (ringBg >= 0.45) keep = false;
+        }
+        if (keep) {
+          entities.push({
+            cell: cellIndex,
+            type,
+            rgb: [Math.round(sumR / area), Math.round(sumG / area), Math.round(sumB / area)],
+            score: contrast * compactness * Math.sqrt(areaCells),
+            areaCells,
+            contrast,
+            compactness,
+          });
+        }
+      }
+    }
+    resetCounts();
+  }
+  return entities;
 }
 
 /** 与 sampleCell 记录的边缘方向顺序一致：0 上 / 1 下 / 2 左 / 3 右。 */
@@ -432,6 +785,10 @@ function sampleCell(
   // 保留背景时背景像素仍参与取色，但要标记出来：亮特征通路靠它区分「主体内部的高光」
   // 和「压在轮廓边上的白底」，否则白底会把描边掏成一个个白色缺口。
   const sampleBackground = backgroundMask && !removingBackground ? [] : null;
+  // 亮特征还要判断「亮点是不是成块的」：低格数下高光只命中 2~4 个采样点，
+  // 必须和沿边缘散落的抗锯齿亮点区分开，所以记录每个采样点在格内的位置。
+  const sampleSx = [];
+  const sampleSy = [];
   let backgroundCount = 0;
   // 被剔除的背景色均值：去背景时前景样本里只剩描边/细线，需要靠它判断“浅底上的深线”。
   // 只累计高置信度的背景像素：掩膜向外扩的 1 像素（主体交界处的混色）置信度 ≤0.35，
@@ -528,6 +885,8 @@ function sampleCell(
       }
       const simplified = simplifySourceRgb(rgb, speckleStrength);
       samples.push(simplified);
+      sampleSx.push(sx);
+      sampleSy.push(sy);
       r += srgbToLinearUnit(simplified[0]);
       g += srgbToLinearUnit(simplified[1]);
       b += srgbToLinearUnit(simplified[2]);
@@ -565,6 +924,8 @@ function sampleCell(
   return {
     samples,
     sampleBackground,
+    sampleSx,
+    sampleSy,
     average:
       samples.length > 0
         ? [
@@ -758,7 +1119,7 @@ function selectCandidateColors(cells, ranked, maxColors, activePalette, profile,
       let gain = 0;
       for (let t = 0; t < targets.length; t += 1) {
         const value = distance[t * pool.length + p];
-        if (value < best[t]) gain += (best[t] - value) * targets[t].weight;
+        if (value < best[t]) gain += (best[t] - value) * (targets[t].weight + targets[t].featureWeight);
       }
       if (gain > bestGain) {
         bestGain = gain;
@@ -874,6 +1235,29 @@ function rebalanceGradientBudget(selected, selectedIds, protectedIds, targets, d
     return score;
   };
 
+  // 找出「换掉它代价最小」的已选色号。细节/眼睛/主色这类没有替代色的不能动。
+  const removableColors = (nearest, nearestAt, second) => {
+    const removable = [];
+    for (let s = 0; s < selected.length; s += 1) {
+      const color = selected[s];
+      const p = poolIndex.get(color.id);
+      if (p === undefined || protectedIds.has(color.id)) continue;
+      let cost = 0;
+      let critical = false;
+      for (let t = 0; t < targetCount; t += 1) {
+        if (nearestAt[t] !== p) continue;
+        const gap = second[t] - nearest[t];
+        cost += gap * targets[t].weight;
+        // 换掉这个色号会让某个有面积的色块彻底没有替代色（细节/眼睛/主色），不能动。
+        // 特征实体格同理：它是必须存在的那个色号。
+        if (gap > 18 && (targets[t].weight >= 2 || targets[t].featureWeight >= 1)) critical = true;
+      }
+      if (!critical) removable.push({ index: p, color, cost });
+    }
+    removable.sort((a, b) => a.cost - b.cost);
+    return removable;
+  };
+
   for (let swap = 0; swap < maxSwaps; swap += 1) {
     const { nearest, nearestAt, second } = measure();
     const currentSmooth = smoothScore(nearest);
@@ -904,24 +1288,8 @@ function rebalanceGradientBudget(selected, selectedIds, protectedIds, targets, d
       continue;
     }
 
-    const removable = [];
-    for (let s = 0; s < selected.length; s += 1) {
-      const color = selected[s];
-      const p = poolIndex.get(color.id);
-      if (p === undefined || protectedIds.has(color.id)) continue;
-      let cost = 0;
-      let critical = false;
-      for (let t = 0; t < targetCount; t += 1) {
-        if (nearestAt[t] !== p) continue;
-        const gap = second[t] - nearest[t];
-        cost += gap * targets[t].weight;
-        // 换掉这个色号会让某个有面积的色块彻底没有替代色（细节/眼睛/主色），不能动。
-        if (gap > 18 && targets[t].weight >= 2) critical = true;
-      }
-      if (!critical) removable.push({ index: p, color, cost });
-    }
+    const removable = removableColors(nearest, nearestAt, second);
     if (removable.length === 0) break;
-    removable.sort((a, b) => a.cost - b.cost);
 
     let bestSwap = null;
     for (const candidate of candidates.slice(0, candidateLimit)) {
@@ -951,6 +1319,9 @@ function rebalanceGradientBudget(selected, selectedIds, protectedIds, targets, d
     selected.push(pool[bestSwap.candidate.index]);
     selectedIds.add(pool[bestSwap.candidate.index].id);
   }
+
+  // 真实空间台阶在最终排豆后处理（relieveSmoothSteps）：选色阶段按「最近的 Lab 色号」
+  // 预测输出，与两阶段匹配 + 平滑格统一后的实际排豆不一致，实测会越调越差。
 }
 
 /** 把格子目标色量化成加权直方图，让选色只跟“实际出现的颜色”有关，也避免逐像素计算。 */
@@ -972,6 +1343,7 @@ function buildTargetHistogram(cells, profile, targetGrid) {
       skinWeight: 0,
       neutralDetailWeight: 0,
       backgroundWeight: 0,
+      featureWeight: 0,
     };
     bucket.sum[0] += rgb[0];
     bucket.sum[1] += rgb[1];
@@ -1004,6 +1376,13 @@ function buildTargetHistogram(cells, profile, targetGrid) {
     bucket.backgroundWeight += background * weight;
     // 平滑区面积单独记一份：补色只应该花在“大面积渐变”上，不该被碎纹理抢走。
     if (cell.smooth) bucket.smoothWeight += weight * (profile.dither === 'none' ? 0.9 : 1.15);
+    // 特征实体格要在色板里保住自己的色号：高光/瞳孔面积小，覆盖率贪心很容易
+    // 把它们判给「同一个色板色号反正也能凑近」的大面积色。额外权重按 sqrt(面积)
+    // 和局部对比缩放，并设上限，避免少数实体把中间调挤掉。
+    if (cell.entityFeature) {
+      const entity = cell.entityFeature;
+      bucket.featureWeight += Math.min(1.5, Math.sqrt(entity.areaCells) * (0.5 + entity.contrast / 160));
+    }
     buckets.set(key, bucket);
   }
   const targets = [];
@@ -1016,6 +1395,8 @@ function buildTargetHistogram(cells, profile, targetGrid) {
       skinWeight: bucket.skinWeight,
       neutralDetailWeight: bucket.neutralDetailWeight,
       backgroundWeight: bucket.backgroundWeight,
+      // 同一目标桶里可能落了好几个实体格，封顶保证它不会单靠数量压过主色。
+      featureWeight: Math.min(3, bucket.featureWeight),
     });
   }
   return targets;
@@ -1227,6 +1608,17 @@ function ditherCellColors(targets, width, height, matcher) {
 }
 
 function cellTargetColor(cell, profile) {
+  // 特征实体优先：高光/瞳孔这类小特征在低格数下不足 1 格，格内采样和平均色都会
+  // 把它抹掉；实体是直接在源像素上量出来的，见过就直接用它的颜色。
+  // 下面的亮/暗特征通路保留为「没有实体时」的兜底（例如特征紧贴格子边界、
+  // 连通域被背景/尺寸判据挡掉的情况）。
+  const entity = cell.entityFeature;
+  if (entity) {
+    cell.featureStrength = 1;
+    cell.directionalFeature = false;
+    cell.edge = true;
+    return entity.rgb;
+  }
   // 二次元的眼白/高光是「暗格里的亮点」，暗色升格覆盖不到，单独走亮特征通路。
   // 保留背景也开：低格数时一颗高光只占 5%~10% 样本，靠格内平均色永远读不出来。
   // 白底混进格子的情况由 sampleBackground 标记排除（见 minorityLightFeatureRgb）。
@@ -1360,23 +1752,47 @@ function minorityLightFeatureRgb(cell) {
   // 黑瞳 60% + 白高光 40% 的格子 luma 已经被拉到 120 左右，阈值太严会整格漏掉。
   // 上限取 130：再亮就是「白底/眼白占主导」的格子，暗色细线（睫毛、描边）更该赢。
   if (primaryLuminance > 130) return null;
+  if (cell.contrast < 30) return null;
   const limit = Math.max(150, primaryLuminance + 70);
   const light = [];
   let backgroundLight = 0;
+  let minX = 99;
+  let maxX = -1;
+  let minY = 99;
+  let maxY = -1;
   for (let i = 0; i < cell.samples.length; i += 1) {
     if (luminance(cell.samples[i]) < limit) continue;
     light.push(cell.samples[i]);
     if (cell.sampleBackground && cell.sampleBackground[i]) backgroundLight += 1;
+    const sx = cell.sampleSx ? cell.sampleSx[i] : 0;
+    const sy = cell.sampleSy ? cell.sampleSy[i] : 0;
+    if (sx < minX) minX = sx;
+    if (sx > maxX) maxX = sx;
+    if (sy < minY) minY = sy;
+    if (sy > maxY) maxY = sy;
   }
   const share = light.length / cell.samples.length;
   // 太多说明主色本来就该是亮的。
   if (share > 0.5) return null;
-  // 低格数时一颗高光只覆盖 4%~10% 的格子：用绝对样本数兜底，不再要求 18% 占比。
-  // 7×7 采样下 0.3 格的高光经常只命中 2 个点，所以下限取 2；抗锯齿噪点靠下面的
-  // 色差（≥80）和白底占比继续过滤。
-  if (light.length < Math.max(2, Math.round(cell.samples.length * 0.03))) return null;
+  if (light.length === 0) return null;
+  // 保留背景时只在「暗色为主」的格子里升格：明暗交界格（亮区贴着深色描边）整格涂亮
+  // 会让描边断成点。去背景模式没有这个问题（白底已被剔除，剩下的亮点都在主体内部）。
+  if (cell.backgroundKept && cell.darkShare < 0.5) return null;
+  if (share < 0.18) {
+    // 低格数时一颗高光只覆盖 4%~10% 的格子，按占比会被整格漏掉。这类小高光必须是
+    // 「暗格里的实心小块」：格子本身以暗色为主（高光只占一小角），亮点在采样网格里
+    // 成块（2×2 以上），且实际尺寸不能是 1~2px 的抗锯齿噪点（≥3px）。
+    // 高格数时采样步长只有 0.6~1px，2×2 的小块往往只是描边旁的抗锯齿过渡，会被尺寸门槛挡掉。
+    if (cell.darkShare < 0.5) return null;
+    const boxWidth = maxX - minX + 1;
+    const boxHeight = maxY - minY + 1;
+    if (boxWidth < 2 || boxHeight < 2) return null;
+    if (light.length / (boxWidth * boxHeight) < 0.7) return null;
+    const step = cell.sampleStep || 1;
+    if (Math.min(boxWidth, boxHeight) * step < 3) return null;
+  }
   // 亮点大多来自白底（描边/头发压在白底上）时不能升格，否则轮廓被掏成白色缺口。
-  if (light.length > 0 && backgroundLight / light.length >= 0.5) return null;
+  if (backgroundLight / light.length >= 0.5) return null;
   if (cell.edgeStrength < 8 && cell.edgeCoherence < 0.5) return null;
   const rgb = meanColor(light);
   return colorDistance(rgb, cell.average) >= 80 ? rgb : null;
@@ -1730,6 +2146,97 @@ function reduceTinyRegions(cells, width, height, strength, candidates, sampled) 
     });
   }
   return next;
+}
+
+/**
+ * 平滑区台阶收敛：上色完成后，把「源图两格几乎同色、输出却差 >22」的邻接对收敛到
+ * 同一颗豆，让色带边界向内移动一格，而不是凭空多出一条硬跳变。
+ *
+ * 为什么放在最后：最终颜色由两阶段匹配 + 平滑格统一决定，选色阶段按「最近 Lab 色号」
+ * 预测的排豆与实际结果不一致（实测在选色阶段交换色号会让台阶变多）。只有拿最终
+ * cells 量台阶，才和视觉报告的指标同口径。
+ *
+ * 安全边界：只动普通平滑格（描边/细线/实体/背景不参与），单格目标色误差增加值 ≤16，
+ * 且改动必须让该格四周的硬跳变数量下降；总改动上限为格子数的 6%。
+ */
+function relieveSmoothSteps(cells, sampled, targetGrid, width, height) {
+  const STEP_LIMIT = 22;
+  const MAX_ERROR_INCREASE = 16;
+  const maxChanges = Math.max(1, Math.round(cells.length * 0.06));
+  let changes = 0;
+  const eligible = (index) => {
+    const cell = sampled[index];
+    return Boolean(
+      cells[index] &&
+        cell &&
+        cell.smooth &&
+        !cell.edge &&
+        !cell.deepFeatureRgb &&
+        !cell.featureStrength &&
+        targetGrid[index],
+    );
+  };
+  const neighbors = (index) => {
+    const x = index % width;
+    const y = (index - x) / width;
+    const list = [];
+    if (x > 0) list.push(index - 1);
+    if (x + 1 < width) list.push(index + 1);
+    if (y > 0) list.push(index - width);
+    if (y + 1 < height) list.push(index + width);
+    return list;
+  };
+  for (let y = 0; y < height && changes < maxChanges; y += 1) {
+    for (let x = 0; x < width && changes < maxChanges; x += 1) {
+      const index = y * width + x;
+      if (!eligible(index)) continue;
+      for (const [dx, dy] of [[1, 0], [0, 1]]) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx >= width || ny >= height) continue;
+        const neighbor = ny * width + nx;
+        if (!eligible(neighbor)) continue;
+        const averageA = sampled[index].average;
+        const averageB = sampled[neighbor].average;
+        if (!averageA || !averageB) continue;
+        // 与视觉报告的平滑邻接对同口径：源图平均色每通道差 ≤8。
+        if (
+          Math.abs(averageA[0] - averageB[0]) > 8 ||
+          Math.abs(averageA[1] - averageB[1]) > 8 ||
+          Math.abs(averageA[2] - averageB[2]) > 8
+        ) {
+          continue;
+        }
+        const colorA = getColor(cells[index]);
+        const colorB = getColor(cells[neighbor]);
+        if (!colorA || !colorB) continue;
+        if (colorDistance(colorA.rgb, colorB.rgb) <= STEP_LIMIT) continue;
+        // 改哪一格更划算：比较「把该格换成邻格豆色」后它的目标色误差增加多少。
+        const costA =
+          labDistance(targetGrid[index], colorB.rgb) - labDistance(targetGrid[index], colorA.rgb);
+        const costB =
+          labDistance(targetGrid[neighbor], colorA.rgb) - labDistance(targetGrid[neighbor], colorB.rgb);
+        const changeIndex = costA <= costB ? index : neighbor;
+        const nextColor = changeIndex === index ? colorB : colorA;
+        if (Math.min(costA, costB) > MAX_ERROR_INCREASE) continue;
+        // 局部台阶必须真的变少：只把边界挪一格，不能把相邻关系改得更碎。
+        let before = 0;
+        let after = 0;
+        for (const near of neighbors(changeIndex)) {
+          const nearColor = cells[near] ? getColor(cells[near]) : null;
+          if (!nearColor) continue;
+          const current = changeIndex === index ? colorA : colorB;
+          if (colorDistance(current.rgb, nearColor.rgb) > STEP_LIMIT) before += 1;
+          if (colorDistance(nextColor.rgb, nearColor.rgb) > STEP_LIMIT) after += 1;
+        }
+        if (after >= before) continue;
+        cells[changeIndex] = nextColor.id;
+        changes += 1;
+        if (changes >= maxChanges) break;
+      }
+    }
+  }
+  return changes;
 }
 
 function mergeSimilarColors(cells, width, height, strength, candidates, sampled) {

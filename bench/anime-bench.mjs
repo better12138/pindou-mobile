@@ -157,7 +157,7 @@ function findHighlightSpots(fixture, backgroundMask) {
 }
 
 /**
- * 每个源图高光点是否在输出里有对应亮豆：只认「原本偏暗」的格子（排除浅色皮肤上的亮豆），
+ * 每个源图高光点是否在输出里有对应亮豆：只认「原本含暗部」的格子（排除纯浅色皮肤上的亮豆），
  * 且允许 3×3 偏移（高光不足 1 格时会被吸收到相邻格）。
  */
 function spotRetention(spots, fixture, samples, cells, gridWidth, gridHeight) {
@@ -174,8 +174,8 @@ function spotRetention(spots, fixture, samples, cells, gridWidth, gridHeight) {
         const index = ny * gridWidth + nx;
         const id = cells[index];
         if (!id) continue;
-        // 源格本身必须偏暗，否则「皮肤本来就是浅色」也会被算成高光。
-        if (lightness(samples[index].mean) > 80) continue;
+        // 源格本身必须含暗部（虹膜/瞳孔/描边），否则「皮肤本来就是浅色」也会被算成高光。
+        if (samples[index].darkShare < 0.1) continue;
         const color = getColor(id);
         if (color && lightness(color.rgb) > 75) found = true;
       }
