@@ -1,0 +1,21 @@
+{
+  "currency": "CNY",
+  "standard": {
+    "name": "标准版",
+    "price": 9.9,
+    "credits": 20,
+    "plan": "A"
+  },
+  "promo": {
+    "name": "开业版",
+    "price": 9.9,
+    "credits": 30,
+    "plan": "B",
+    "enabled": true,
+    "endsAt": null,
+    "endCondition": "开业期结束条件待定，由运营在 endsAt 填入截止日期或把 enabled 改为 false"
+  },
+  "buyChannel": "小红书私信 @拼豆图纸生成器",
+  "buyNote": "付款后收到带 PB- 前缀的兑换码，在电脑端或手机端输入即可，两端额度共用。",
+  "buyUrl": ""
+}

@@ -16,10 +16,10 @@ const directory = fileURLToPath(new URL('./results/', import.meta.url));
 mkdirSync(directory, { recursive: true });
 const PANEL = 420;
 const CONFIG = {
-  width: 110,
-  maxColors: 40,
+  width: Number(process.env.WIDTH || 110),
+  maxColors: Number(process.env.COLORS || 40),
   brand: 'MARD',
-  generationStyle: 'cartoon',
+  generationStyle: process.env.STYLE || 'cartoon',
   backgroundMode: 'keep',
   tolerance: 44,
   speckleReduction: 1,

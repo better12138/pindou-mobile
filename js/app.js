@@ -17,18 +17,19 @@ import { BoardViewer } from './viewer.js';
 import { exportChart, exportUsageCsv } from './export.js';
 import { printProject, printCalibration, resolveCellMm, normalizePitch } from './print.js';
 import { initInstall } from './install.js';
+import { initEntitlement, requireExport, refreshEntitlement, bindPcLink } from './entitlement.js';
 import { EditHistory, cellChange, doneChange, compact } from './history.js';
 import { CropTool } from './crop.js';
 
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
-const EDIT_TOOLS = ['brush', 'eraser', 'picker', 'bucket'];
+const EDIT_TOOLS = ['mark', 'brush', 'eraser', 'picker', 'bucket'];
 const TOOL_HINTS = {
-  view: '浏览模式',
-  mark: '点格子标记完成',
-  brush: '单指涂色，双指缩放',
-  eraser: '单指擦除，双指缩放',
+  view: '双指缩放 · 双击放大',
+  mark: '点或拖动标记 · 再点取消',
+  brush: '单指涂色 · 长按吸色',
+  eraser: '单指擦除 · 长按吸色',
   picker: '点格子吸取颜色',
   bucket: '点区域填充当前色',
 };
@@ -38,9 +39,14 @@ const state = {
   viewer: null,
   tool: 'view',
   filter: null,
+  paint: null,
   pending: null,
   saveTimer: 0,
   stroke: null,
+  strokeDone: null,
+  markTarget: null,
+  restoreTool: null,
+  tempPicked: null,
   replaceFrom: null,
   replaceTo: null,
   cropTool: null,
@@ -70,6 +76,12 @@ function toast(message, options = {}) {
 function setLoading(active, text = '正在生成图纸…') {
   $('#loading-text').textContent = text;
   $('#loading').classList.toggle('hidden', !active);
+}
+
+/** 立刻收起仍在显示的 toast，避免旧提示描述的是上一个动作。 */
+function hideToast() {
+  clearTimeout(toastTimer);
+  $('#toast').classList.remove('show');
 }
 
 function nextFrame() {
@@ -544,7 +556,10 @@ function openProject(id) {
   localStorage.setItem(LAST_PROJECT_KEY, id);
   state.project = project;
   state.filter = null;
+  state.paint = null;
   state.stroke = null;
+  state.strokeDone = null;
+  state.markTarget = null;
   state.history.clear();
   setTool('view');
   if (location.hash !== `#p=${id}`) history.pushState(null, '', `#p=${id}`);
@@ -562,11 +577,16 @@ function openProject(id) {
     state.viewer = new BoardViewer($('#board'), {
       onTapCell: handleTapCell,
       onStroke: handleStroke,
+      onLongPressStart: handleLongPressStart,
+      onLongPressMove: handleLongPressMove,
+      onLongPressEnd: handleLongPressEnd,
       onViewChange: (label) => {
         $('#zoom-badge').textContent = label;
       },
     });
   }
+  state.viewer.setEditTool('view');
+  state.viewer.setPaintColor(null);
   state.viewer.setProject(project);
   state.viewer.setFilter(null);
   state.viewer.start();
@@ -588,6 +608,11 @@ function goHome() {
   state.project = null;
   state.compare = { mode: 'off', image: null };
   state.regenerateFrom = null;
+  state.paint = null;
+  state.strokeDone = null;
+  state.markTarget = null;
+  state.restoreTool = null;
+  state.tempPicked = null;
   state.history.clear();
   setTool('view');
   localStorage.removeItem(LAST_PROJECT_KEY);
@@ -622,58 +647,118 @@ function switchTab(tab) {
     });
   }
   if (tab === 'usage') renderUsage();
+  if (tab === 'settings') refreshEntitlement();
 }
 
 $$('.tab').forEach((button) => button.addEventListener('click', () => switchTab(button.dataset.tab)));
 
 /* ---------------- 工具与逐格编辑 ---------------- */
 
+const TOOL_LABELS = { view: '浏览', mark: '勾选', brush: '画笔', eraser: '橡皮', picker: '吸管', bucket: '填充' };
+
+/** 只切换高亮，不触发取色/筛选等副作用。 */
+function updateToolButtons() {
+  $$('#tool-row [data-tool]').forEach((button) => button.classList.toggle('active', button.dataset.tool === state.tool));
+}
+
 function setTool(tool) {
   state.tool = tool;
-  $$('#tool-row [data-tool]').forEach((button) => button.classList.toggle('active', button.dataset.tool === tool));
+  updateToolButtons();
   if (state.viewer) state.viewer.setPainting(EDIT_TOOLS.includes(tool));
-  $('#tool-hint').textContent = TOOL_HINTS[tool] || '';
-  if (tool === 'brush' || tool === 'bucket') ensureBrushColor();
+  if (tool === 'brush' || tool === 'bucket') ensurePaintColor();
+  if (state.viewer) {
+    state.viewer.setEditTool(tool);
+    state.viewer.setPaintColor(state.paint);
+  }
+  applyViewerFilter();
+  renderToolHint();
+  renderProgress();
+  renderColorStrip();
 }
 
 $('#tool-row').addEventListener('click', (event) => {
   const button = event.target.closest('[data-tool]');
-  if (button) setTool(button.dataset.tool);
+  if (button) {
+    hideToast();
+    setTool(button.dataset.tool);
+  }
 });
 
-function ensureBrushColor() {
-  if (state.filter && getColor(state.filter)) return;
+/** 筛选只用于浏览/勾选的「只看某色」，画笔/橡皮/填充/吸管都不压暗画布。 */
+function applyViewerFilter() {
+  if (!state.viewer) return;
+  const isolate = state.tool === 'view' || state.tool === 'mark';
+  state.viewer.setFilter(isolate ? state.filter : null);
+  state.viewer.invalidate();
+}
+
+/** 画笔颜色：优先沿用当前筛选色，否则取用量最高的颜色。 */
+function ensurePaintColor() {
+  if (state.paint && getColor(state.paint)) return;
+  if (state.filter && getColor(state.filter)) {
+    state.paint = state.filter;
+    return;
+  }
   const usage = state.project ? computeUsage(state.project) : null;
   const first = usage && usage.rows[0];
-  if (first) setFilter(first.id);
+  if (first) state.paint = first.id;
   else toast('这张图纸还没有颜色', { error: true });
+}
+
+function setPaint(colorId) {
+  state.paint = colorId || null;
+  if (state.viewer) state.viewer.setPaintColor(state.paint);
+  renderToolHint();
+  renderColorStrip();
 }
 
 function setFilter(colorId) {
   state.filter = colorId || null;
-  if (state.viewer) {
-    state.viewer.setFilter(state.filter);
-    state.viewer.invalidate();
-  }
+  applyViewerFilter();
   renderProgress();
   renderColorStrip();
-  if (state.tool === 'picker' && state.filter) {
-    // 吸管取完色自动回到画笔，少点一次
-    setTool('brush');
+}
+
+/** 工具提示带上当前色号，避免「不知道画笔用的是什么颜色」。 */
+function renderToolHint() {
+  const base = TOOL_HINTS[state.tool] || '';
+  const color = (state.tool === 'brush' || state.tool === 'bucket' || state.tool === 'picker') && state.paint
+    ? getColor(state.paint)
+    : null;
+  const hint = $('#tool-hint');
+  if (color) {
+    hint.innerHTML = `<i class="hint-swatch" style="background:${color.hex}"></i>${escapeHtml(base)} · ${escapeHtml(color.code)}`;
+  } else {
+    hint.textContent = base;
   }
 }
 
 function handleStroke(phase, index) {
   const project = state.project;
   if (!project) return;
-  if (phase === 'start') state.stroke = new Map();
 
-  if (phase === 'start' || phase === 'move') {
+  if (phase === 'start') {
+    hideToast();
+    state.stroke = new Map();
+    state.strokeDone = new Map();
+    state.markTarget = null;
+  }
+
+  if (state.tool === 'mark') {
+    // 起手决定是「补齐」还是「取消」：在同一笔里保持一致，避免来回横跳。
+    if (phase === 'start') state.markTarget = project.done[index] ? 0 : 1;
+    const change = doneChange(project, index, state.markTarget);
+    if (change) {
+      project.done[index] = change.to;
+      if (state.strokeDone) state.strokeDone.set(index, change);
+      state.viewer.invalidate();
+    }
+  } else if (phase === 'start' || phase === 'move') {
     if (state.tool === 'brush' || state.tool === 'eraser') {
       paintCell(index);
       state.viewer.invalidate();
     } else if (state.tool === 'picker') {
-      pickColor(index);
+      pickColor(index, phase === 'move');
     } else if (state.tool === 'bucket' && phase === 'start') {
       bucketFill(index);
       state.viewer.invalidate();
@@ -681,18 +766,26 @@ function handleStroke(phase, index) {
   }
 
   if (phase === 'end') {
-    const changes = state.stroke ? [...state.stroke.values()] : [];
+    const cells = state.stroke ? [...state.stroke.values()] : [];
+    const done = state.strokeDone ? [...state.strokeDone.values()] : [];
     state.stroke = null;
-    if (changes.length) {
-      state.history.push({ cells: changes });
-      refreshAfterEdit();
+    state.strokeDone = null;
+    state.markTarget = null;
+    if (cells.length || done.length) {
+      state.history.push({ cells, done });
+      refreshAfterEdit({ thumb: state.tool !== 'mark' });
+      if (state.tool === 'bucket') toast(`已填充 ${cells.length} 颗 · 可撤销`);
+    } else if (state.tool === 'brush') {
+      toast('这些格子已经是当前色了，可在下方换色');
+    } else if (state.tool === 'eraser') {
+      toast('这些格子已经是空的');
     }
   }
 }
 
 function paintCell(index) {
   const project = state.project;
-  const to = state.tool === 'eraser' ? null : state.filter;
+  const to = state.tool === 'eraser' ? null : state.paint;
   if (!to && state.tool === 'brush') return;
   const change = cellChange(project, index, to);
   if (!change) return;
@@ -700,23 +793,30 @@ function paintCell(index) {
   if (state.stroke) state.stroke.set(index, change);
 }
 
-function pickColor(index) {
+/** 吸管：取色后停留在吸管工具，方便连续吸多个颜色；长按临时吸管则由松手流程恢复工具。 */
+function pickColor(index, quiet = false) {
   const id = state.project.cells[index];
   if (!id) {
-    toast('这个位置没有豆子');
-    return;
+    if (!quiet) toast('这个位置没有豆子');
+    return null;
   }
   const color = getColor(id);
-  setFilter(id);
-  toast(`已吸取 ${color ? color.code : ''}，可以继续涂`);
+  state.paint = id;
+  renderToolHint();
+  renderColorStrip();
+  if (!quiet) toast(`已吸取 ${color ? color.code : ''} · 可继续点其它格`);
+  return id;
 }
 
 function bucketFill(index) {
   const project = state.project;
-  const to = state.filter;
+  const to = state.paint;
   if (!to) return;
   const target = project.cells[index] || null;
-  if (target === to) return;
+  if (target === to) {
+    toast('这片区域已经是当前色了');
+    return;
+  }
   const stack = [index];
   const seen = new Set();
   const width = project.width;
@@ -740,28 +840,70 @@ function bucketFill(index) {
   }
 }
 
-function handleTapCell(index) {
-  const project = state.project;
-  if (!project || !project.cells[index]) return;
-  if (state.tool !== 'mark') {
-    toast('先切到「勾选」工具再点格子');
-    return;
+/* ---------------- 长按临时吸管 ---------------- */
+
+function handleLongPressStart(index) {
+  if (state.tool === 'picker') return;
+  state.restoreTool = state.tool;
+  state.tempPicked = null;
+  setTool('picker');
+  const id = state.project.cells[index];
+  if (id) {
+    state.tempPicked = id;
+    state.paint = id;
+    renderColorStrip();
+    const color = getColor(id);
+    $('#tool-hint').textContent = `吸管（临时）· 已吸取 ${color ? color.code : ''}，松手返回${TOOL_LABELS[state.restoreTool] || ''}`;
+  } else {
+    $('#tool-hint').textContent = '吸管（临时）· 移到有豆的格子';
   }
-  const change = doneChange(project, index, !project.done[index]);
-  if (!change) return;
-  project.done[index] = change.to;
-  state.history.push({ done: [change] });
-  state.viewer.invalidate();
-  refreshAfterEdit({ thumb: false });
+}
+
+function handleLongPressMove(index) {
+  const id = state.project.cells[index];
+  if (!id) return;
+  state.tempPicked = id;
+  state.paint = id;
+  renderColorStrip();
+  const color = getColor(id);
+  $('#tool-hint').textContent = `吸管（临时）· 已吸取 ${color ? color.code : ''}，松手返回${TOOL_LABELS[state.restoreTool] || ''}`;
+}
+
+function handleLongPressEnd() {
+  const restore = state.restoreTool;
+  state.restoreTool = null;
+  if (!restore) return;
+  const picked = state.tempPicked;
+  state.tempPicked = null;
+  // 勾选模式吸色后直接只看这一色；浏览模式仅在原本就在筛选时跟随切换。
+  if (picked && (restore === 'mark' || (restore === 'view' && state.filter))) state.filter = picked;
+  setTool(restore);
+  if (picked) {
+    const color = getColor(picked);
+    toast(`已吸取 ${color ? color.code : ''} · 已回到${TOOL_LABELS[restore] || ''}`);
+  }
+}
+
+function handleTapCell() {
+  // 浏览模式单击不再弹「先切到勾选」：勾选已支持点按/拖动，浏览模式点按保持安静。
 }
 
 /** 编辑后统一刷新：统计、用量、筛选、缩略图、落盘。 */
 function refreshAfterEdit({ thumb = true } = {}) {
   const project = state.project;
   if (!project) return;
+  const cleared = [];
   if (state.filter && !getColor(state.filter)) {
     state.filter = null;
-    if (state.viewer) state.viewer.setFilter(null);
+    cleared.push('filter');
+  }
+  if (state.paint && !getColor(state.paint)) {
+    state.paint = null;
+    cleared.push('paint');
+  }
+  if (cleared.length) {
+    applyViewerFilter();
+    renderToolHint();
   }
   let total = 0;
   const used = new Set();
@@ -883,7 +1025,8 @@ function renderProgress() {
   $('#progress-text').textContent = `${done} / ${total} 颗`;
   $('#progress-percent').textContent = `${percent}%`;
   $('#progress-fill').style.width = `${percent}%`;
-  if (state.filter) {
+  const isolate = Boolean(state.filter) && (state.tool === 'view' || state.tool === 'mark');
+  if (isolate) {
     const color = getColor(state.filter);
     const remaining = countRemaining(state.filter);
     $('#filter-status').textContent = color ? `只看 ${color.code} · 还剩 ${remaining} 颗` : '';
@@ -920,11 +1063,13 @@ function renderColorStrip() {
   const usage = computeUsage(project);
   const remainingMap = remainingByColor();
   const rows = usage.rows.slice().sort((a, b) => b.count - a.count);
+  const isolate = state.tool === 'view' || state.tool === 'mark';
+  const activeId = isolate ? state.filter : state.paint;
   $('#color-strip').innerHTML = rows
     .map((row) => {
       const remaining = remainingMap.get(row.id)?.remaining ?? 0;
       const classes = ['color-chip'];
-      if (state.filter === row.id) classes.push('active');
+      if (activeId === row.id) classes.push('active');
       if (remaining === 0) classes.push('done');
       return `
         <button class="${classes.join(' ')}" data-color="${row.id}">
@@ -936,8 +1081,8 @@ function renderColorStrip() {
     .join('');
 
   const bar = $('#filter-bar');
-  bar.classList.toggle('hidden', !state.filter);
-  if (state.filter) {
+  bar.classList.toggle('hidden', !(isolate && state.filter));
+  if (isolate && state.filter) {
     const color = getColor(state.filter);
     $('#filter-label').textContent = color ? `${color.code} · ${brandLabels[color.brand] || ''}` : '';
   }
@@ -964,8 +1109,18 @@ window.addEventListener('orientationchange', () => setTimeout(updateColorStripCu
 $('#color-strip').addEventListener('click', (event) => {
   const chip = event.target.closest('.color-chip');
   if (!chip) return;
+  hideToast();
   const id = chip.dataset.color;
-  setFilter(state.filter === id ? null : id);
+  const isolate = state.tool === 'view' || state.tool === 'mark';
+  if (isolate) {
+    // 浏览/勾选：点色卡是「只看这一色」，再次点击取消筛选。
+    const next = state.filter === id ? null : id;
+    if (next) state.paint = next;
+    setFilter(next);
+  } else {
+    // 画笔/橡皮/填充/吸管：点色卡只切换当前用色，不会把颜色取消掉。
+    setPaint(id);
+  }
 });
 
 $('#btn-clear-filter').addEventListener('click', () => setFilter(null));
@@ -1009,12 +1164,14 @@ $('#btn-fill-color').addEventListener('click', () => {
 
 $('#btn-replace').addEventListener('click', () => {
   if (!state.project) return;
-  let from = state.filter;
+  let from = state.filter || state.paint;
   if (!from) {
     const rows = computeUsage(state.project).rows;
-    if (!rows.length) return;
+    if (!rows.length) {
+      toast('这张图纸还没有颜色', { error: true });
+      return;
+    }
     from = rows[0].id;
-    setFilter(from);
   }
   state.replaceFrom = from;
   state.replaceTo = null;
@@ -1026,49 +1183,84 @@ $('#sheet-replace').addEventListener('click', (event) => {
   if (event.target.closest('[data-close]')) $('#sheet-replace').setAttribute('aria-hidden', 'true');
 });
 
+function replaceChip(row, active, attr) {
+  const disabled = attr === 'data-target' && row.disabled;
+  return `
+    <button class="replace-chip${active ? ' active' : ''}" ${attr}="${row.id}" ${disabled ? 'disabled' : ''}>
+      <span class="swatch" style="background:${row.color.hex}"></span>
+      <span class="code">${escapeHtml(row.color.code)}</span>
+      <span class="count">${row.count}</span>
+    </button>`;
+}
+
 function renderReplaceGrid() {
   const project = state.project;
   if (!project) return;
   const usage = computeUsage(project);
+  if (!usage.rows.length) {
+    state.replaceFrom = null;
+    state.replaceTo = null;
+    $('#replace-source').innerHTML = '';
+    $('#replace-grid').innerHTML = '<div class="replace-empty">这张图纸还没有颜色。</div>';
+    $('#replace-hint').textContent = '先给图纸涂上颜色，再整色替换。';
+    $('#btn-replace-apply').disabled = true;
+    $('#btn-replace-apply').textContent = '确认替换';
+    return;
+  }
+  if (!state.replaceFrom || !usage.rows.some((row) => row.id === state.replaceFrom)) {
+    state.replaceFrom = usage.rows[0].id;
+  }
   const source = usage.rows.find((row) => row.id === state.replaceFrom);
-  const sourceColor = source ? source.color : null;
-  $('#replace-hint').textContent = sourceColor
-    ? `把 ${sourceColor.code}（${source.count} 颗）替换为：`
-    : '先选一个源颜色';
-  $('#replace-grid').innerHTML = usage.rows
-    .map((row) => {
-      const disabled = row.id === state.replaceFrom;
-      const active = row.id === state.replaceTo;
-      return `
-        <button class="replace-chip${active ? ' active' : ''}" data-id="${row.id}" ${disabled ? 'disabled' : ''}>
-          <span class="swatch" style="background:${row.color.hex}"></span>
-          <span class="code">${escapeHtml(row.color.code)}</span>
-          <span class="count">${row.count}</span>
-        </button>`;
-    })
+  const targets = usage.rows.filter((row) => row.id !== state.replaceFrom);
+  if (state.replaceTo && !targets.some((row) => row.id === state.replaceTo)) state.replaceTo = null;
+  const target = state.replaceTo ? usage.rows.find((row) => row.id === state.replaceTo) : null;
+
+  $('#replace-source').innerHTML = usage.rows
+    .map((row) => replaceChip(row, row.id === state.replaceFrom, 'data-source'))
     .join('');
+  $('#replace-grid').innerHTML = targets.length
+    ? targets
+        .map((row) => replaceChip({ ...row, disabled: row.id === state.replaceFrom }, row.id === state.replaceTo, 'data-target'))
+        .join('')
+    : '<div class="replace-empty">只有一种颜色，暂时没有可替换的目标。</div>';
+
+  $('#replace-hint').textContent = source
+    ? target
+      ? `将把 ${source.count} 颗 ${source.color.code} 换成 ${target.color.code}，执行后可撤销。`
+      : `源色 ${source.color.code} 共 ${source.count} 颗，请选择目标颜色。`
+    : '先选要替换掉的源颜色，再选目标颜色。';
+
   const button = $('#btn-replace-apply');
   button.disabled = !state.replaceTo;
-  const targetColor = state.replaceTo ? getColor(state.replaceTo) : null;
-  button.textContent = targetColor && sourceColor ? `把 ${sourceColor.code} 全部换成 ${targetColor.code}` : '确认替换';
+  button.textContent = source && target ? `把 ${source.color.code} 全部换成 ${target.color.code}（${source.count} 颗）` : '确认替换';
 }
+
+$('#replace-source').addEventListener('click', (event) => {
+  const chip = event.target.closest('[data-source]');
+  if (!chip) return;
+  state.replaceFrom = chip.dataset.source;
+  state.replaceTo = null;
+  renderReplaceGrid();
+});
 
 $('#replace-grid').addEventListener('click', (event) => {
   const chip = event.target.closest('.replace-chip');
   if (!chip || chip.disabled) return;
-  state.replaceTo = chip.dataset.id;
+  state.replaceTo = chip.dataset.target;
   renderReplaceGrid();
 });
 
 $('#btn-replace-apply').addEventListener('click', () => {
   const project = state.project;
   if (!project || !state.replaceFrom || !state.replaceTo) return;
+  const from = state.replaceFrom;
+  const to = state.replaceTo;
   const changes = [];
   project.cells.forEach((id, index) => {
-    if (id !== state.replaceFrom) return;
-    const change = cellChange(project, index, state.replaceTo);
+    if (id !== from) return;
+    const change = cellChange(project, index, to);
     if (!change) return;
-    project.cells[index] = state.replaceTo;
+    project.cells[index] = to;
     changes.push(change);
   });
   if (!changes.length) {
@@ -1076,9 +1268,17 @@ $('#btn-replace-apply').addEventListener('click', () => {
     return;
   }
   state.history.push({ cells: changes });
+  // 替换后源色通常不再使用：不再继续「只看源色」，画笔顺势切到目标色。
+  if (state.filter === from) state.filter = null;
+  if (state.paint === from) state.paint = to;
   $('#sheet-replace').setAttribute('aria-hidden', 'true');
+  applyViewerFilter();
+  if (state.viewer) state.viewer.setPaintColor(state.paint);
+  renderToolHint();
   refreshAfterEdit();
-  toast(`已替换 ${changes.length} 颗`);
+  const fromColor = getColor(from);
+  const toColor = getColor(to);
+  toast(`已替换 ${changes.length} 颗：${fromColor ? fromColor.code : ''} → ${toColor ? toColor.code : ''}`);
 });
 
 /* ---------------- 保存 ---------------- */
@@ -1389,6 +1589,7 @@ $('#btn-wizard-recalibrate').addEventListener('click', () => showPrintStep(1));
 
 $('#btn-wizard-print').addEventListener('click', () => {
   if (!state.project) return;
+  if (!requireExport('print')) return;
   closePrintWizard();
   toast(`正在准备 A4 分页（${resolveCellMm(state.calibration).toFixed(2)}mm/格）…`);
   setTimeout(() => printProject(state.project, state.calibration), 120);
@@ -1397,12 +1598,14 @@ $('#btn-wizard-print').addEventListener('click', () => {
 $('#btn-export-png').addEventListener('click', () => exportPng());
 $('#btn-export-csv').addEventListener('click', () => {
   if (!state.project) return;
+  if (!requireExport('csv')) return;
   exportUsageCsv(state.project, computeUsage(state.project));
   toast('用量 CSV 已导出');
 });
 
 function exportPng() {
   if (!state.project) return;
+  if (!requireExport('png')) return;
   toast('正在生成 PNG…');
   setTimeout(() => {
     try {
@@ -1577,6 +1780,23 @@ async function bootstrap() {
   if (initial && initial[1]) openProject(initial[1]);
 
   initInstall({ showHelp: openHelp, toast });
+  initEntitlement({ toast });
+  bindPcLink(() => state.project);
+
+  // 从电脑端跳转过来：两端图纸格式不同，不自动带入，只提示一下。
+  const params = new URLSearchParams(location.search);
+  if (params.get('from') === 'pc') {
+    const name = params.get('name');
+    const size = params.get('w') && params.get('h') ? `${params.get('w')}×${params.get('h')}` : '';
+    setTimeout(
+      () =>
+        toast(
+          `已从电脑端跳转${name ? `（${name}${size ? ` · ${size}` : ''}）` : ''}：两端图纸格式不同，未自动带入，可在这里重新选图生成。`,
+          { duration: 5200 },
+        ),
+      700,
+    );
+  }
 }
 
 bootstrap();

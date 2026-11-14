@@ -1,6 +1,6 @@
 // Service Worker：缓存 app shell，让装到桌面的应用离线也能打开。
 // 注意：改版本号才会触发更新，新增文件记得同步加入 SHELL。
-const VERSION = 'pindou-shell-v11';
+const VERSION = 'pindou-shell-v20';
 const SHELL = [
   './',
   './index.html',
@@ -10,8 +10,12 @@ const SHELL = [
   './icon-192.png',
   './icon-512.png',
   './apple-touch-icon.png',
+  '/pricing.json',
   './js/app.js',
   './js/install.js',
+  './js/license-core.js',
+  './js/pricing.js',
+  './js/entitlement.js',
   './js/print.js',
   './js/viewer.js',
   './js/convert.js',

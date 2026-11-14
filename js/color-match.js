@@ -68,7 +68,11 @@ export function matchPaletteColor(rgb, colors) {
   return getMatcher(colors).match(rgb);
 }
 
-function createMatcher(colors) {
+/**
+ * 直接创建匹配器（不走按数组缓存）。转换一次图片就建一个：
+ * matcher 内部有按 5bit/通道的匹配缓存，跨图片复用会让结果依赖「之前转过哪些图」。
+ */
+export function createMatcher(colors) {
   const count = colors.length;
   const coarse = new Float32Array(count * 3);
   for (let i = 0; i < count; i += 1) {
@@ -80,6 +84,8 @@ function createMatcher(colors) {
   const useCoarse = count > TOP_CANDIDATES;
   // 同一批像素会反复匹配同一颜色：按 5bit/通道缓存（与 palette.js 口径一致），
   // 把 291 次距离计算降成一次查表；照片里的大量近似色也能命中。
+  // 注意：整块色板的 matcher 不能跨图片复用这个缓存——量化键会让「先转的那张图」
+  // 决定同一色桶的答案，同一张图先转/后转结果不同。转换时用 createMatcher 建独立实例。
   const cache = new Map();
 
   function matchFull(rgb) {

@@ -28,6 +28,7 @@
               <span>拼豆 · 移动端</span>
             </div>
             <button class="install-chip hidden" id="btn-install">安装到桌面</button>
+            <button class="credit-chip" id="btn-credit" type="button">兑换</button>
           </div>
           <h1>把手机里的照片<br />变成能照着拼的图纸</h1>
           <p class="home-sub">拍照选图 · 自动配色号 · 边拼边勾进度 · 数据只存在本机</p>
@@ -274,6 +275,16 @@
               <button class="action wide" id="btn-print-calibration">打印校准页</button>
             </div>
 
+            <div class="settings-group">
+              <span class="settings-label">导出额度</span>
+              <div class="settings-row">
+                <span>剩余次数</span><span class="muted"><b data-credit-balance>0</b> 次</span>
+              </div>
+              <button class="action wide" id="btn-open-credit">兑换码 / 购买额度</button>
+              <a class="action wide" id="btn-open-pc" href="/?from=mobile#app">在电脑上精修（PDF / 大图）</a>
+              <p class="field-hint">额度与电脑端共用；导出 PNG、A4 分页打印、导出 CSV 各消耗 1 次。</p>
+            </div>
+
             <p class="field-hint">打印时请在系统打印里选「100% / 实际大小」，不要用「适应页面」，否则尺寸会偏小。</p>
             <button class="action wide" id="btn-print">打印分页图纸（A4）</button>
             <button class="action wide" id="btn-export-png">导出图纸 PNG</button>
@@ -338,7 +349,10 @@
               <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" /></svg>
             </button>
           </div>
-          <p class="field-hint" id="replace-hint">先选一个颜色，再选要替换成的颜色。</p>
+          <p class="field-hint" id="replace-hint">先选要替换掉的源颜色，再选目标颜色。</p>
+          <span class="replace-label">源颜色（点选）</span>
+          <div class="replace-source-strip" id="replace-source"></div>
+          <span class="replace-label">目标颜色</span>
           <div class="replace-grid" id="replace-grid"></div>
           <button class="action primary wide" id="btn-replace-apply" disabled>确认替换</button>
         </div>
@@ -385,6 +399,38 @@
             <button class="action wide primary" id="btn-wizard-print">开始打印</button>
             <button class="action wide" id="btn-wizard-recalibrate">重新校准</button>
           </div>
+        </div>
+      </div>
+
+      <!-- ========== 兑换 / 额度 ========== -->
+      <div class="sheet" id="sheet-credit" aria-hidden="true">
+        <div class="sheet-mask" data-close="1"></div>
+        <div class="sheet-card">
+          <div class="sheet-head">
+            <h2>兑换 / 额度</h2>
+            <button class="icon-btn" data-close="1" aria-label="关闭">
+              <svg viewBox="0 0 24 24"><path d="M6 6l12 12M18 6 6 18" /></svg>
+            </button>
+          </div>
+
+          <div class="credit-summary">
+            当前剩余 <strong data-credit-balance>0</strong> 次
+          </div>
+          <input
+            id="credit-input"
+            class="text-input"
+            type="text"
+            inputmode="text"
+            autocapitalize="characters"
+            autocomplete="off"
+            spellcheck="false"
+            placeholder="PB-XXXX-XXXX-XXXX"
+            aria-label="兑换码"
+          />
+          <p class="field-hint" id="credit-message"></p>
+          <button class="action wide primary" id="btn-credit-submit" type="button">兑换</button>
+
+          <div class="credit-price" id="credit-price-note"></div>
         </div>
       </div>
 

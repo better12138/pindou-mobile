@@ -1,21 +1,24 @@
 // 图片 → 拼豆格子。移植自拼豆 PC 项目（MIT），去掉分层/画板边界等桌面端概念。
-import { colorDistance, labDistance, palettes } from './palette.js';
-import { getMatcher } from './color-match.js';
+import { colorDistance, colorDistanceLab, labDistance, palettes } from './palette.js';
+import { createMatcher, getMatcher } from './color-match.js';
 import { blueNoiseThresholds } from './bluenoise.js';
 
 const styleProfiles = {
   cartoon: {
     sampleSide: 7,
     backgroundThreshold: 0.72,
-    dominanceThreshold: 0.58,
     postStrengthBias: 1,
     dither: 'none',
+    // 二次元眼睛靠「眼白 + 白高光」读出来：暗格里的亮点要能整格升格。
+    lightFeature: true,
   },
   realistic: {
     sampleSide: 5,
     backgroundThreshold: 0.58,
-    dominanceThreshold: 0.5,
-    postStrengthBias: -1,
+    // 写实模式之前默认不做后处理（bias -1 → 强度 0），噪点图里大量单颗抖动豆被当成
+    // “细节”留下：110/40 实测孤立豆 11.2%、台阶 358/千。bias 改成 0 后默认走 1 级
+    // 清理，只有真正孤立的同色豆会被合并；实测孤立豆 5.4%、台阶 220/千，ΔE 持平。
+    postStrengthBias: 0,
     // 写实模式默认走蓝噪声有序抖动：阈值矩阵预生成，避免误差扩散把孤立单豆串成噪点。
     dither: 'blue-noise',
   },
@@ -54,20 +57,28 @@ export function convertToBeads(source, options) {
   const ditherMode = options.ditherMode || profile.dither;
   const strength = options.speckleReduction ?? 1;
   const speckleStrength = strength > 0 ? clampStrength(strength + profile.postStrengthBias) : 0;
+  const background = estimateBackground(
+    source.data,
+    source.width,
+    source.height,
+    options.tolerance ?? 42,
+  );
   const normalized = {
     ...options,
     // 默认保留背景：天空/底色也是图纸的一部分。去背景必须是用户主动打开的选择。
     backgroundMode: options.backgroundMode || 'keep',
     tolerance: options.tolerance ?? 42,
     palette: activePalette,
+    backgroundCenters: background.centers,
   };
 
   const gridWidth = Math.max(1, Math.round(options.width));
   const gridHeight = Math.max(1, Math.round((source.height / source.width) * gridWidth));
-  const background = estimateBackground(source.data, source.width, source.height, normalized.tolerance);
   // 背景必须是「和画面边缘连通」的那一片：主体内部恰好同色的区域（白衬衫、反光）不会被挖空。
-  const backgroundMask =
-    normalized.backgroundMode === 'keep' ? null : buildBackgroundMask(source, background.centers);
+  // 保留背景时也要算：它不用于剔除，只用于识别「亮点是白底还是主体内部的高光」。
+  const removingBackground = normalized.backgroundMode !== 'keep';
+  const backgroundModel = buildBackgroundModel(source, background.centers);
+  const backgroundMask = backgroundModel.mask;
   clock('background');
   const sampled = sampleGridCells(
     source,
@@ -75,15 +86,23 @@ export function convertToBeads(source, options) {
     gridHeight,
     normalized,
     backgroundMask,
+    backgroundModel.confidence,
     profile,
     speckleStrength,
+    removingBackground,
   );
   clock('sample');
   // 目标色只算一次：选色直方图和最终上色共用，避免同一格用两套颜色判断。
-  // 平滑格直接用已算好的格内平均色，跳过聚类（聚类只在描边/细节格有意义，且是热路径大头）。
-  const targetGrid = sampled.map((cell) => (cell.smooth ? cell.average : cellTargetColor(cell, profile)));
+  // 平滑格直接用已算好的格内平均色，跳过聚类（聚类只在描边/细节格有意义，且是热路径大头）；
+  // 但去背景模式下的剔除条件要照旧生效，否则纯背景格会被当成主体排上珠子。
+  const targetGrid = sampled.map((cell) => cellTargetColor(cell, profile));
+  // 二次元轮廓常常不足 1 格宽，抗锯齿会把它切成「一深一浅」的虚线：两侧格子升格了，
+  // 中间那格只差一点没够到阈值。这里把这类单格断点补上，轮廓才不会断成点。
+  if (profile.dither === 'none') fillLineGaps(targetGrid, sampled, gridWidth, gridHeight);
   clock('target');
-  const paletteMatcher = getMatcher(activePalette);
+  // 整块色板的匹配器每次转换新建：matcher 内部的量化缓存不能跨图片复用，
+  // 否则「同一张图先转还是后转」会得到不同色号（非确定性）。
+  const paletteMatcher = createMatcher(activePalette);
   const ranked = rankPaletteColors(sampled, normalized, paletteMatcher, profile);
   clock('rank');
   const candidates = selectCandidateColors(
@@ -98,10 +117,11 @@ export function convertToBeads(source, options) {
   const matcher = getMatcher(candidates);
   const cells =
     ditherMode === 'blue-noise'
-      ? blueNoiseDither(sampled, gridWidth, gridHeight, matcher, profile)
+      ? blueNoiseDither(targetGrid, gridWidth, gridHeight, matcher)
       : ditherMode === 'error-diffusion'
-        ? ditherCellColors(sampled, gridWidth, gridHeight, matcher, profile)
-        : sampled.map((cell) => chooseCellColor(cell, matcher, profile));
+        ? ditherCellColors(targetGrid, gridWidth, gridHeight, matcher)
+        // 直接按目标色上色：与选色直方图共用同一套目标，避免两套判断给出不同颜色。
+        : targetGrid.map((target) => chooseCellColor(target, matcher));
   // 只在不抖动时做：抖动本来就靠交替色号制造混色，再去“统一”等于把抖动抹掉。
   if (ditherMode === 'none') {
     consolidateSmoothCells(cells, sampled, targetGrid, matcher, gridWidth, gridHeight);
@@ -111,9 +131,9 @@ export function convertToBeads(source, options) {
   const edgeFlags = new Uint8Array(sampled.length);
   for (let i = 0; i < sampled.length; i += 1) edgeFlags[i] = sampled[i].edge ? 1 : 0;
 
-  const merged = mergeSimilarColors(cells, speckleStrength, candidates);
-  const compact = reduceTinyRegions(merged, gridWidth, gridHeight, speckleStrength, candidates, edgeFlags);
-  const reduced = reduceSpeckles(compact, gridWidth, gridHeight, speckleStrength, candidates, edgeFlags);
+  const merged = mergeSimilarColors(cells, gridWidth, gridHeight, speckleStrength, candidates, sampled);
+  const compact = reduceTinyRegions(merged, gridWidth, gridHeight, speckleStrength, candidates, sampled);
+  const reduced = reduceSpeckles(compact, gridWidth, gridHeight, speckleStrength, candidates, sampled);
   const used = reduced.filter(Boolean);
   clock('cleanup');
   if (timings) timings.total = Math.round(nowMs() - clock.start);
@@ -137,7 +157,7 @@ export function convertToBeads(source, options) {
 export function analyzeBackground(source, options = {}) {
   const tolerance = options.tolerance ?? 42;
   const background = estimateBackground(source.data, source.width, source.height, tolerance);
-  const mask = buildBackgroundMask(source, background.centers);
+  const mask = buildBackgroundModel(source, background.centers).mask;
   let removed = 0;
   for (let i = 0; i < mask.length; i += 1) if (mask[i]) removed += 1;
   return { centers: background.centers, source: background.source, mask, ratio: removed / mask.length };
@@ -193,11 +213,32 @@ function createClock(timings) {
   return clock;
 }
 
-function sampleGridCells(source, width, height, options, backgroundMask, profile, speckleStrength) {
+function sampleGridCells(
+  source,
+  width,
+  height,
+  options,
+  backgroundMask,
+  backgroundConfidence,
+  profile,
+  speckleStrength,
+  removingBackground,
+) {
   const cells = [];
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
-      const sampled = sampleCell(source, x, y, width, height, profile.sampleSide, backgroundMask, speckleStrength);
+      const sampled = sampleCell(
+        source,
+        x,
+        y,
+        width,
+        height,
+        profile.sampleSide,
+        backgroundMask,
+        backgroundConfidence,
+        speckleStrength,
+        removingBackground,
+      );
       const span = colorDistance(sampled.low, sampled.high);
       // 去背景时白底被剔除，细线可能连点采样都全部落空（整格看起来就是纯背景）。
       // 这时按整格像素再找一次线芯；保留背景时不走这条分支——实测它会把浅底的
@@ -207,29 +248,200 @@ function sampleGridCells(source, width, height, options, backgroundMask, profile
       }
       cells.push({
         samples: sampled.samples,
+        sampleBackground: sampled.sampleBackground,
         average: sampled.average,
         backgroundShare: sampled.backgroundShare,
+        backgroundConfidence: sampled.backgroundConfidence,
+        backgroundAffinity: backgroundAffinity(sampled.average, options.backgroundCenters),
         backgroundRgb: sampled.backgroundRgb,
         deepFeatureRgb: sampled.deepFeatureRgb || null,
+        darkShare: sampled.darkShare,
+        darkEdges: sampled.darkEdges,
+        contrast: sampled.contrast,
+        edgeStrength: sampled.edgeStrength,
+        edgeCoherence: sampled.edgeCoherence,
+        edgeDirection: sampled.edgeDirection,
         // 细线特征格也按边缘格保护，避免被去孤立豆/微小区域清理抹掉。
-        edge: Boolean(sampled.deepFeatureRgb) || (sampled.samples.length > 0 && span > 92),
+        edge:
+          Boolean(sampled.deepFeatureRgb) ||
+          (sampled.samples.length > 0 && (span > 92 || sampled.edgeStrength > 18)),
         // 格内颜色几乎不变 = 平滑区（天空、皮肤、渐变）。色号预算会优先照顾这些区域。
-        smooth: !sampled.deepFeatureRgb && sampled.samples.length > 0 && span < 24,
+        smooth:
+          !sampled.deepFeatureRgb &&
+          sampled.samples.length > 0 &&
+          span < 24,
       });
     }
+  }
+  // 这条判据只服务「保留背景」模式：去背景模式的主体轮廓线本来就细，且已有
+  // deepFeatureRgb 的全像素扫描兜底；在那里收紧暗色升格会削细轮廓、抬高细线断裂率。
+  if (!removingBackground) {
+    markDarkMassCells(cells, width, height);
+  }
+  // 「大块暗区压边」判据只用于卡通：写实模式的噪点/边缘本身就大量贴在大块暗区上，
+  // 收紧升格会让细线断得更多（实测 9.06%→9.31%），而写实模式的观感收益并不明显。
+  if (profile.dither === 'none') {
+    markDarkThicknessCells(cells, width, height);
   }
   return cells;
 }
 
+/** 与 sampleCell 记录的边缘方向顺序一致：0 上 / 1 下 / 2 左 / 3 右。 */
+const NEIGHBOR_OFFSETS = [
+  [0, -1],
+  [0, 1],
+  [-1, 0],
+  [1, 0],
+];
+
+/** 相邻两条边组成的四个斜角（上左/上右/下左/下右），索引与 NEIGHBOR_OFFSETS 一致。 */
+const DIAGONAL_SIDES = [
+  [0, 2],
+  [0, 3],
+  [1, 2],
+  [1, 3],
+];
+
+/**
+ * 标记「暗色部分属于大块暗区」的格子（头发、深色衣服、深色背景压到主体边缘的格子）。
+ *
+ * 为什么需要：`minorityDarkFeatureRgb` 的暗色升格是为白底细线/眼睛设计的，
+ * 只要格子整体偏亮、暗像素占到 10%~15% 就整格上暗色。遇到物体边界（边上一角是
+ * 大块深色）时，这一格会被整格涂成近黑，对照原图时明明是米白/肤色却出现黑豆，
+ * 这就是「豆的颜色和图对不上」最刺眼的一类。
+ *
+ * 判据取「暗区厚度」而不是暗像素占比：先把暗格（暗占比 ≥50%）做连通分量，
+ * 分量里若存在 4 邻域全暗的格子，说明厚度至少 3 格，是实心大块暗区；
+ * 细线/描边通常只有 1~2 格厚，永远凑不出这种内部格，因此不会被误伤。
+ * 只有「某一侧边缘暗占比 ≥40% 且那一侧邻格属于厚实暗区」的格子才取消升格。
+ */
+function markDarkMassCells(cells, width, height) {
+  const total = cells.length;
+  const shares = new Float32Array(total);
+  for (let i = 0; i < total; i += 1) shares[i] = cells[i].darkShare;
+  const labels = new Int32Array(total).fill(-1);
+  const thick = [];
+  const queue = new Int32Array(total);
+  for (let start = 0; start < total; start += 1) {
+    if (labels[start] !== -1 || shares[start] < 0.5) continue;
+    const component = thick.length;
+    let thickFlag = 0;
+    let head = 0;
+    let tail = 0;
+    queue[tail] = start;
+    tail += 1;
+    labels[start] = component;
+    while (head < tail) {
+      const index = queue[head];
+      head += 1;
+      const x = index % width;
+      const y = (index - x) / width;
+      let darkNeighbors = 0;
+      for (const [dx, dy] of NEIGHBOR_OFFSETS) {
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const neighbor = ny * width + nx;
+        if (shares[neighbor] < 0.5) continue;
+        darkNeighbors += 1;
+        if (labels[neighbor] === -1) {
+          labels[neighbor] = component;
+          queue[tail] = neighbor;
+          tail += 1;
+        }
+      }
+      if (darkNeighbors === 4) thickFlag = 1;
+    }
+    thick.push(thickFlag);
+  }
+
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      // 暗像素本来就过半的格子会按主导色上暗色，升格与否结果一致，跳过省算力。
+      if (shares[index] >= 0.35) continue;
+      const edges = cells[index].darkEdges;
+      let darkMass = false;
+      for (let side = 0; side < 4 && !darkMass; side += 1) {
+        if (edges[side] < 0.4) continue;
+        const [dx, dy] = NEIGHBOR_OFFSETS[side];
+        const nx = x + dx;
+        const ny = y + dy;
+        if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+        const neighbor = ny * width + nx;
+        if (shares[neighbor] < 0.3) continue;
+        const label = labels[neighbor];
+        if (label !== -1 && thick[label]) darkMass = true;
+      }
+      cells[index].darkMass = darkMass;
+    }
+  }
+}
+
+/**
+ * 标记「大块暗区的内部格」：自身暗像素过半，且四邻域也全暗。
+ *
+ * 用来区分两种长得一样的情况：
+ * - 头发、虹膜这种大块暗区压到格子边角：格子大部分是浅色，只有一角是暗的；
+ * - 一条细线（描边、睫毛、胡须）擦过格子：暗像素同样只占一小部分。
+ * 差别在于暗区有没有「内部」：厚度 ≥3 格的大块暗区一定存在四邻全暗的格子，
+ * 细线只有 1~2 格厚，永远凑不出来。只有细线才该整格升格成暗色豆，
+ * 否则浅色格会被暗区啃掉一圈（眼白/高光被虹膜吃成黑豆就是这么来的）。
+ */
+function markDarkThicknessCells(cells, width, height) {
+  const total = cells.length;
+  const dark = new Uint8Array(total);
+  for (let i = 0; i < total; i += 1) dark[i] = cells[i].darkShare >= 0.5 ? 1 : 0;
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const cell = cells[index];
+      cell.darkNeighbors = NEIGHBOR_OFFSETS.map(([dx, dy]) => {
+        const nx = x + dx;
+        const ny = y + dy;
+        return nx < 0 || ny < 0 || nx >= width || ny >= height ? null : cells[ny * width + nx];
+      });
+      if (!dark[index]) continue;
+      let interior = true;
+      for (const neighbor of cell.darkNeighbors) {
+        if (!neighbor || neighbor.darkShare < 0.5) {
+          interior = false;
+          break;
+        }
+      }
+      cell.darkInterior = interior;
+    }
+  }
+}
+
 /** 单个格子的 side×side 子采样；边缘格会用更大的 side 再采一遍。 */
-function sampleCell(source, x, y, width, height, side, backgroundMask, speckleStrength) {
+function sampleCell(
+  source,
+  x,
+  y,
+  width,
+  height,
+  side,
+  backgroundMask,
+  backgroundConfidence,
+  speckleStrength,
+  removingBackground,
+) {
   const { data, width: sourceWidth, height: sourceHeight } = source;
   const samples = [];
+  // 保留背景时背景像素仍参与取色，但要标记出来：亮特征通路靠它区分「主体内部的高光」
+  // 和「压在轮廓边上的白底」，否则白底会把描边掏成一个个白色缺口。
+  const sampleBackground = backgroundMask && !removingBackground ? [] : null;
   let backgroundCount = 0;
   // 被剔除的背景色均值：去背景时前景样本里只剩描边/细线，需要靠它判断“浅底上的深线”。
+  // 只累计高置信度的背景像素：掩膜向外扩的 1 像素（主体交界处的混色）置信度 ≤0.35，
+  // 它们的颜色接近主体而不是背景，混进来会把「背景色」估成肤色/主体色，后续
+  // scanCellDarkFeature 就会把真正的背景当成描边，整格涂成背景色。
   let backgroundR = 0;
   let backgroundG = 0;
   let backgroundB = 0;
+  let backgroundColorCount = 0;
+  let backgroundConfidenceSum = 0;
   // 平均值在线性光空间累加：直接在 sRGB 上平均会让明暗交界处整体偏暗，
   // 回到 sRGB 后更接近原图观感（不是把结果硬调亮）。
   let r = 0;
@@ -238,6 +450,21 @@ function sampleCell(source, x, y, width, height, side, backgroundMask, speckleSt
   // 同时记录格内颜色跨度，用于识别描边/轮廓所在的边缘格（后续减少误伤）。
   const low = [255, 255, 255];
   const high = [0, 0, 0];
+  // 暗像素统计：整格占比 + 四条边各自占比，用来区分「细线穿过」和「大块暗区压边」。
+  let darkCount = 0;
+  const edgeDark = [0, 0, 0, 0];
+  const edgeCount = [0, 0, 0, 0];
+  let leftLuminance = 0;
+  let rightLuminance = 0;
+  let topLuminance = 0;
+  let bottomLuminance = 0;
+  let leftCount = 0;
+  let rightCount = 0;
+  let topCount = 0;
+  let bottomCount = 0;
+  let luminanceSum = 0;
+  let luminanceSquaredSum = 0;
+  let luminanceCount = 0;
   for (let sy = 0; sy < side; sy += 1) {
     for (let sx = 0; sx < side; sx += 1) {
       const sourceX = Math.min(
@@ -251,6 +478,26 @@ function sampleCell(source, x, y, width, height, side, backgroundMask, speckleSt
       const index = (sourceY * sourceWidth + sourceX) * 4;
       const alpha = data[index + 3];
       const rgb = [data[index], data[index + 1], data[index + 2]];
+      const rawLuminance = luminance(rgb);
+      if (sx < side / 2) {
+        leftLuminance += rawLuminance;
+        leftCount += 1;
+      }
+      if (sx >= (side - 1) / 2) {
+        rightLuminance += rawLuminance;
+        rightCount += 1;
+      }
+      if (sy < side / 2) {
+        topLuminance += rawLuminance;
+        topCount += 1;
+      }
+      if (sy >= (side - 1) / 2) {
+        bottomLuminance += rawLuminance;
+        bottomCount += 1;
+      }
+      luminanceSum += rawLuminance;
+      luminanceSquaredSum += rawLuminance * rawLuminance;
+      luminanceCount += 1;
       // 边缘跨度要把背景像素也算进去：白底黑线这种格子若只看前景样本会显得“很平”，
       // 描边保护就失效了。
       for (let channel = 0; channel < 3; channel += 1) {
@@ -262,21 +509,62 @@ function sampleCell(source, x, y, width, height, side, backgroundMask, speckleSt
         continue;
       }
       if (backgroundMask !== null && backgroundMask[sourceY * sourceWidth + sourceX] === 1) {
-        backgroundCount += 1;
-        backgroundR += data[index];
-        backgroundG += data[index + 1];
-        backgroundB += data[index + 2];
-        continue;
+        if (!removingBackground) {
+          if (sampleBackground) sampleBackground.push(1);
+        } else {
+          backgroundCount += 1;
+          const pixelConfidence = backgroundConfidence?.[sourceY * sourceWidth + sourceX] ?? 1;
+          backgroundConfidenceSum += pixelConfidence;
+          if (pixelConfidence > 0.35) {
+            backgroundR += data[index];
+            backgroundG += data[index + 1];
+            backgroundB += data[index + 2];
+            backgroundColorCount += 1;
+          }
+          continue;
+        }
+      } else if (sampleBackground) {
+        sampleBackground.push(0);
       }
       const simplified = simplifySourceRgb(rgb, speckleStrength);
       samples.push(simplified);
       r += srgbToLinearUnit(simplified[0]);
       g += srgbToLinearUnit(simplified[1]);
       b += srgbToLinearUnit(simplified[2]);
+      const isDark = luminance(simplified) < 100;
+      if (isDark) darkCount += 1;
+      // 侧边方向：0 上 / 1 下 / 2 左 / 3 右
+      if (sy === 0) {
+        edgeCount[0] += 1;
+        if (isDark) edgeDark[0] += 1;
+      }
+      if (sy === side - 1) {
+        edgeCount[1] += 1;
+        if (isDark) edgeDark[1] += 1;
+      }
+      if (sx === 0) {
+        edgeCount[2] += 1;
+        if (isDark) edgeDark[2] += 1;
+      }
+      if (sx === side - 1) {
+        edgeCount[3] += 1;
+        if (isDark) edgeDark[3] += 1;
+      }
     }
   }
+  const horizontalChange = Math.abs(
+    leftLuminance / Math.max(1, leftCount) - rightLuminance / Math.max(1, rightCount),
+  );
+  const verticalChange = Math.abs(
+    topLuminance / Math.max(1, topCount) - bottomLuminance / Math.max(1, bottomCount),
+  );
+  const directionalChange = horizontalChange + verticalChange;
+  const meanLuminance = luminanceCount > 0 ? luminanceSum / luminanceCount : 0;
+  const variance =
+    luminanceCount > 0 ? Math.max(0, luminanceSquaredSum / luminanceCount - meanLuminance * meanLuminance) : 0;
   return {
     samples,
+    sampleBackground,
     average:
       samples.length > 0
         ? [
@@ -286,14 +574,22 @@ function sampleCell(source, x, y, width, height, side, backgroundMask, speckleSt
           ]
         : null,
     backgroundShare: backgroundCount / (side * side),
+    backgroundConfidence: backgroundCount > 0 ? backgroundConfidenceSum / backgroundCount : 0,
     backgroundRgb:
-      backgroundCount > 0 && backgroundR + backgroundG + backgroundB > 0
+      backgroundColorCount > 0 && backgroundR + backgroundG + backgroundB > 0
         ? [
-            Math.round(backgroundR / backgroundCount),
-            Math.round(backgroundG / backgroundCount),
-            Math.round(backgroundB / backgroundCount),
+            Math.round(backgroundR / backgroundColorCount),
+            Math.round(backgroundG / backgroundColorCount),
+            Math.round(backgroundB / backgroundColorCount),
           ]
         : null,
+    darkShare: samples.length > 0 ? darkCount / samples.length : 0,
+    darkEdges: edgeCount.map((count, index) => (count > 0 ? edgeDark[index] / count : 0)),
+    contrast: Math.sqrt(variance),
+    edgeStrength: Math.max(horizontalChange, verticalChange),
+    edgeCoherence:
+      directionalChange > 0 ? Math.max(horizontalChange, verticalChange) / directionalChange : 0,
+    edgeDirection: horizontalChange >= verticalChange ? 'vertical' : 'horizontal',
     low,
     high,
   };
@@ -388,7 +684,9 @@ function rankPaletteColors(cells, options, matcher, profile) {
       return { ...entry, score: entry.count * featureBoost };
     })
     .sort((a, b) => b.score - a.score || b.count - a.count);
-  return rows.length > 0 ? rows : activePalette.slice(0, options.maxColors).map((color) => ({ color, count: 1, score: 1 }));
+  return rows.length > 0
+    ? rows
+    : options.palette.slice(0, options.maxColors).map((color) => ({ color, count: 1, score: 1 }));
 }
 
 /**
@@ -437,13 +735,14 @@ function selectCandidateColors(cells, ranked, maxColors, activePalette, profile,
     poolIds.add(color.id);
     pool.push(color);
   }
-  // 预算“目标色 × 候选色”的距离矩阵，之后每轮只做加法比较。
+  // 预算“目标色 × 候选色”的 Lab 感知距离矩阵，之后每轮只做加法比较。
   const distance = new Float32Array(targets.length * pool.length);
   for (let t = 0; t < targets.length; t += 1) {
     for (let p = 0; p < pool.length; p += 1) {
       distance[t * pool.length + p] = labDistance(targets[t].rgb, pool[p].rgb);
     }
   }
+  reserveTargetColors(targets, pool, distance, maxColors, add, protectedIds);
   const best = new Float32Array(targets.length);
   for (let t = 0; t < targets.length; t += 1) {
     let value = Infinity;
@@ -479,6 +778,37 @@ function selectCandidateColors(cells, ranked, maxColors, activePalette, profile,
   ranked.forEach((entry) => add(entry.color));
   rebalanceGradientBudget(selected, selectedIds, protectedIds, targets, distance, pool, maxColors);
   return selected.length > 0 ? selected : activePalette.slice(0, maxColors);
+}
+
+function reserveTargetColors(targets, pool, distance, maxColors, add, protectedIds) {
+  const poolSize = pool.length;
+  const quota = maxColors >= 24 ? 2 : 1;
+  const reserve = (field, limit) => {
+    const ordered = targets
+      .map((target, index) => ({ index, score: target[field] || 0 }))
+      .filter((entry) => entry.score > 0.45)
+      .sort((a, b) => b.score - a.score);
+    let added = 0;
+    for (const entry of ordered) {
+      let bestIndex = -1;
+      let bestDistance = Infinity;
+      const base = entry.index * poolSize;
+      for (let p = 0; p < poolSize; p += 1) {
+        const value = distance[base + p];
+        if (value < bestDistance) {
+          bestDistance = value;
+          bestIndex = p;
+        }
+      }
+      if (bestIndex < 0 || !add(pool[bestIndex])) continue;
+      protectedIds.add(pool[bestIndex].id);
+      added += 1;
+      if (added >= limit) break;
+    }
+  };
+  reserve('detailWeight', quota);
+  reserve('skinWeight', quota);
+  reserve('neutralDetailWeight', 1);
 }
 
 /**
@@ -633,24 +963,72 @@ function buildTargetHistogram(cells, profile, targetGrid) {
     const rgb = targetGrid ? targetGrid[index] : cellTargetColor(cell, profile);
     if (!rgb) continue;
     const key = ((rgb[0] >> 4) << 8) | ((rgb[1] >> 4) << 4) | (rgb[2] >> 4);
-    const bucket = buckets.get(key) || { sum: [0, 0, 0], weight: 0, smoothWeight: 0 };
+    const bucket = buckets.get(key) || {
+      sum: [0, 0, 0],
+      count: 0,
+      weight: 0,
+      smoothWeight: 0,
+      detailWeight: 0,
+      skinWeight: 0,
+      neutralDetailWeight: 0,
+      backgroundWeight: 0,
+    };
     bucket.sum[0] += rgb[0];
     bucket.sum[1] += rgb[1];
     bucket.sum[2] += rgb[2];
-    bucket.weight += 1;
+    bucket.count += 1;
+    const detail = clampValue(
+      Math.max(cell.featureStrength || 0, cell.edgeStrength / 36, cell.contrast / 48),
+      0,
+      1,
+    );
+    const skin = isSkinTone(rgb) && cell.backgroundAffinity < 0.72 ? 1 : 0;
+    const background = cell.smooth ? cell.backgroundAffinity : cell.backgroundAffinity * 0.45;
+    let weight = 1;
+    if (profile.dither === 'none') {
+      weight *= 1 + detail * 0.55 + skin * 0.22;
+      weight *= 1 - background * 0.48;
+      if (cell.smooth && background < 0.45) weight *= 1.08;
+    } else {
+      weight *= 1 + detail * 0.32 + skin * 0.2;
+      weight *= 1 - background * 0.28;
+      if (cell.smooth) weight *= 1.12;
+    }
+    weight = Math.max(0.35, weight);
+    bucket.weight += weight;
+    bucket.detailWeight += detail * weight;
+    bucket.skinWeight += skin * weight;
+    if (colorChroma(rgb) < 44 && luminance(rgb) < 218 && background < 0.62) {
+      bucket.neutralDetailWeight += (0.5 + detail) * weight * (1 - background * 0.6);
+    }
+    bucket.backgroundWeight += background * weight;
     // 平滑区面积单独记一份：补色只应该花在“大面积渐变”上，不该被碎纹理抢走。
-    if (cell.smooth) bucket.smoothWeight += 1;
+    if (cell.smooth) bucket.smoothWeight += weight * (profile.dither === 'none' ? 0.9 : 1.15);
     buckets.set(key, bucket);
   }
   const targets = [];
   for (const bucket of buckets.values()) {
     targets.push({
-      rgb: bucket.sum.map((channel) => Math.round(channel / bucket.weight)),
+      rgb: bucket.sum.map((channel) => Math.round(channel / bucket.count)),
       weight: bucket.weight,
       smoothWeight: bucket.smoothWeight,
+      detailWeight: bucket.detailWeight,
+      skinWeight: bucket.skinWeight,
+      neutralDetailWeight: bucket.neutralDetailWeight,
+      backgroundWeight: bucket.backgroundWeight,
     });
   }
   return targets;
+}
+
+function isSkinTone(rgb) {
+  const [r, g, b] = rgb;
+  const value = Math.max(r, g, b);
+  const chroma = value - Math.min(r, g, b);
+  if (value < 72 || value > 252 || chroma < 12) return false;
+  const cb = 128 - 0.168736 * r - 0.331264 * g + 0.5 * b;
+  const cr = 128 + 0.5 * r - 0.418688 * g - 0.081312 * b;
+  return cb >= 76 && cb <= 132 && cr >= 132 && cr <= 180;
 }
 
 /**
@@ -739,30 +1117,9 @@ function isFeatureColor(color, count, ranked) {
   return false;
 }
 
-function chooseCellColor(cell, matcher, profile) {
-  if (cell.samples.length === 0 && !cell.deepFeatureRgb) return null;
-  const featureRgb = minorityDarkFeatureRgb(cell.samples, cell.edge, cell.backgroundRgb, cell.deepFeatureRgb);
-  // 深色特征要先于背景占比判断：细线格 90% 是白底，但穿过格子的那条线必须留下，
-  // 否则去背景会把 lineart 的线整条删掉（背景占比阈值只该淘汰“纯背景格”）。
-  if (!featureRgb && cell.backgroundShare >= profile.backgroundThreshold) return null;
-  // 边界格一半以上是背景时直接留空：剩下的样本只是描边和天空的混色，
-  // 会把轮廓染成脏蓝色（白熊图边缘一圈“蓝边”就是这么来的）；有深色描边则保留。
-  if (cell.backgroundShare >= 0.5 && !featureRgb) return null;
-  if (featureRgb) return matcher.match(featureRgb).id;
-  const counts = new Map();
-  for (const rgb of cell.samples) {
-    const color = matcher.match(rgb);
-    const bucket = counts.get(color.id) || { color, count: 0 };
-    bucket.count += 1;
-    counts.set(color.id, bucket);
-  }
-  const ranked = [...counts.values()].sort((a, b) => b.count - a.count);
-  const primary = ranked[0];
-  if (!primary) return null;
-  const primaryShare = primary.count / cell.samples.length;
-  // 没有明显主导色时按整格平均色上色，避免软阴影/渐变格子被多数票拉到某一侧的深色。
-  if (primaryShare >= profile.dominanceThreshold || !cell.average) return primary.color.id;
-  return matcher.match(cell.average).id;
+function chooseCellColor(target, matcher) {
+  if (!target) return null;
+  return matcher.match(target).id;
 }
 
 /** 邻域色差小才算“平滑区”，抖动只在这里生效，避免把描边抖成噪点。 */
@@ -798,11 +1155,11 @@ const BLUE_NOISE_AMPLITUDE = 20;
  * 查表式有序抖动：64×64 蓝噪声阈值矩阵按格坐标取阈值，给目标色加亮度偏移后再匹配色号。
  * 相比误差扩散，不把误差传播给邻居，所以不会出现连锁的孤立单豆；同一阈值矩阵保证可复现。
  */
-function blueNoiseDither(cells, width, height, matcher, profile) {
+function blueNoiseDither(targets, width, height, matcher) {
   const thresholds = blueNoiseThresholds();
-  const base = cells.map((cell) => cellTargetColor(cell, profile));
+  const base = targets;
   const smooth = smoothMask(base, width, height);
-  const result = new Array(cells.length).fill(null);
+  const result = new Array(targets.length).fill(null);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
@@ -823,11 +1180,10 @@ function blueNoiseDither(cells, width, height, matcher, profile) {
   return result;
 }
 
-function ditherCellColors(cells, width, height, matcher, profile) {
-  const targets = cells.map((cell) => cellTargetColor(cell, profile));
+function ditherCellColors(targets, width, height, matcher) {
   const work = targets.map((rgb) => (rgb ? [rgb[0], rgb[1], rgb[2]] : null));
   const base = targets.map((rgb) => (rgb ? [rgb[0], rgb[1], rgb[2]] : null));
-  const result = new Array(cells.length).fill(null);
+  const result = new Array(targets.length).fill(null);
   const strength = 0.4;
   const maxError = 12;
   const smooth = smoothMask(base, width, height);
@@ -871,11 +1227,219 @@ function ditherCellColors(cells, width, height, matcher, profile) {
 }
 
 function cellTargetColor(cell, profile) {
-  const featureRgb = minorityDarkFeatureRgb(cell.samples, cell.edge, cell.backgroundRgb, cell.deepFeatureRgb);
+  // 二次元的眼白/高光是「暗格里的亮点」，暗色升格覆盖不到，单独走亮特征通路。
+  // 保留背景也开：低格数时一颗高光只占 5%~10% 样本，靠格内平均色永远读不出来。
+  // 白底混进格子的情况由 sampleBackground 标记排除（见 minorityLightFeatureRgb）。
+  // 优先于暗色特征：高光常常紧贴瞳孔，按「主导色/暗部」算会被瞳孔吃成黑豆。
+  let featureRgb = profile.lightFeature ? minorityLightFeatureRgb(cell) : null;
+  // 亮特征按强细节处理（featureStrength=1）：孤立的 1 颗亮豆很容易被去孤立豆/微小区域
+  // 当成噪点合并掉，而这正是拼接后要看到的高光。
+  let directionalFeature = false;
+  if (!featureRgb) {
+    featureRgb = minorityDarkFeatureRgb(cell, profile);
+  }
+  if (!featureRgb) {
+    featureRgb = directionalDarkFeatureRgb(cell);
+    directionalFeature = Boolean(featureRgb);
+  }
   if (!featureRgb && !cell.average) return null;
-  if (!featureRgb && cell.backgroundShare >= profile.backgroundThreshold) return null;
-  if (cell.backgroundShare >= 0.5 && !featureRgb) return null;
-  return featureRgb || dominantClusterColor(cell.samples) || cell.average;
+  if (!featureRgb && shouldDropBackgroundCell(cell, profile)) return null;
+  if (featureRgb) {
+    cell.featureStrength = directionalFeature ? 0.72 : 1;
+    cell.directionalFeature = directionalFeature;
+    return featureRgb;
+  }
+  if (cell.smooth || cell.contrast < 9) {
+    cell.featureStrength = 0;
+    return cell.average;
+  }
+  const cluster = dominantCluster(cell.samples);
+  if (!cluster) {
+    cell.featureStrength = Math.min(0.7, cell.edgeStrength / 36);
+    return cell.average;
+  }
+
+  const coherentEdge = cell.edgeCoherence >= 0.58 && cell.edgeStrength >= 10;
+  const stableBlock = cluster.share >= (profile.dither === 'none' ? 0.58 : 0.68);
+  // 卡通模式优先大色块稳定；少量暗像素已在特征检测和 darkMass 判据里单独处理。
+  if (profile.dither === 'none') {
+    cell.featureStrength = clampValue(
+      (cell.contrast / 34) * 0.45 + (cell.edgeStrength / 28) * 0.35 + cluster.share * 0.2,
+      0,
+      1,
+    );
+    return cluster.rgb;
+  }
+  if (!stableBlock && !coherentEdge) {
+    cell.featureStrength = Math.min(0.65, cell.contrast / 42);
+    return cell.average;
+  }
+
+  // 非主导边界只适度推向主色；写实模式始终优先保留明度与渐变连续性。
+  const baseWeight = profile.dither === 'none' ? 0.44 : 0.28;
+  const shareWeight = Math.max(0, cluster.share - 0.5) * (profile.dither === 'none' ? 1.1 : 0.65);
+  const edgeWeight = coherentEdge ? (profile.dither === 'none' ? 0.16 : 0.08) : 0;
+  const weight = clampValue(baseWeight + shareWeight + edgeWeight, 0, profile.dither === 'none' ? 0.82 : 0.48);
+  cell.featureStrength = clampValue(
+    (cell.contrast / 36) * 0.45 + (cell.edgeStrength / 30) * 0.35 + cluster.share * 0.2,
+    0,
+    1,
+  );
+  return mixRgb(cell.average, cluster.rgb, weight);
+}
+
+/** 补齐细线断点时检查的四个方向（左右 / 上下 / 两条对角线）。 */
+const GAP_DIRECTIONS = [
+  [1, 0],
+  [0, 1],
+  [1, 1],
+  [1, -1],
+];
+
+/**
+ * 补齐「描边/细线」里的单格断点（只用于卡通模式）。
+ *
+ * 二次元轮廓通常不到 1 格宽，抗锯齿会把同一条线切成深浅交替的格子：暗像素多的格
+ * 升格成暗色，差一点的格保持浅色，结果就是虚线。这里对「自己也有暗像素、且两侧
+ * 各有一段细线」的浅色格，直接沿用两侧更暗的那个线色，把线连起来。
+ *
+ * 两端都要求是「浅色格升格出来的线」，大块暗区的边界不参与——否则会把暗区补胖一圈。
+ */
+function fillLineGaps(targets, cells, width, height) {
+  const total = targets.length;
+  const meanLuminance = new Float32Array(total);
+  const darkTarget = new Uint8Array(total);
+  for (let i = 0; i < total; i += 1) {
+    meanLuminance[i] = cells[i].average ? luminance(cells[i].average) : 0;
+    const target = targets[i];
+    darkTarget[i] = target && luminance(target) < 60 ? 1 : 0;
+  }
+  const fills = [];
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      if (darkTarget[index] || !targets[index]) continue;
+      if (meanLuminance[index] < 70) continue;
+      const cell = cells[index];
+      // 断点格的暗像素往往只剩 2%~5%（抗锯齿把线稀释了），门槛必须比升格阈值低。
+      if (cell.darkShare < 0.02 || cell.darkShare > 0.4) continue;
+      if (cell.edgeStrength < 12) continue;
+      for (const [dx, dy] of GAP_DIRECTIONS) {
+        const ax = x - dx;
+        const ay = y - dy;
+        const bx = x + dx;
+        const by = y + dy;
+        if (ax < 0 || ay < 0 || ax >= width || ay >= height) continue;
+        if (bx < 0 || by < 0 || bx >= width || by >= height) continue;
+        const a = ay * width + ax;
+        const b = by * width + bx;
+        if (!darkTarget[a] || !darkTarget[b]) continue;
+        if (meanLuminance[a] < 70 || meanLuminance[b] < 70) continue;
+        if (cells[a].darkShare >= 0.5 || cells[b].darkShare >= 0.5) continue;
+        const color = luminance(targets[a]) <= luminance(targets[b]) ? targets[a] : targets[b];
+        fills.push(index, color);
+        break;
+      }
+    }
+  }
+  for (let i = 0; i < fills.length; i += 2) {
+    targets[fills[i]] = fills[i + 1];
+    cells[fills[i]].featureStrength = 0.72;
+    // 补出来的也是线的一部分：按边缘格保护，避免被去孤立豆/微小区域又清掉。
+    cells[fills[i]].edge = true;
+  }
+}
+
+function minorityLightFeatureRgb(cell) {
+  if (!cell.average || cell.samples.length < 8) return null;
+  // 贴着背景的格子（主体轮廓压在白底上）不能用这条通路：白底本身就是「亮点」，
+  // 会把本该是描边的格子排成白色/肤色，轮廓出现一个个洞。
+  if (cell.backgroundShare > 0.08) return null;
+  const primaryLuminance = luminance(cell.average);
+  // 只处理「整体偏暗、内部有亮点」的格。这里用亮度和（luma）而不是均值色：
+  // 黑瞳 60% + 白高光 40% 的格子 luma 已经被拉到 120 左右，阈值太严会整格漏掉。
+  // 上限取 130：再亮就是「白底/眼白占主导」的格子，暗色细线（睫毛、描边）更该赢。
+  if (primaryLuminance > 130) return null;
+  const limit = Math.max(150, primaryLuminance + 70);
+  const light = [];
+  let backgroundLight = 0;
+  for (let i = 0; i < cell.samples.length; i += 1) {
+    if (luminance(cell.samples[i]) < limit) continue;
+    light.push(cell.samples[i]);
+    if (cell.sampleBackground && cell.sampleBackground[i]) backgroundLight += 1;
+  }
+  const share = light.length / cell.samples.length;
+  // 太多说明主色本来就该是亮的。
+  if (share > 0.5) return null;
+  // 低格数时一颗高光只覆盖 4%~10% 的格子：用绝对样本数兜底，不再要求 18% 占比。
+  // 7×7 采样下 0.3 格的高光经常只命中 2 个点，所以下限取 2；抗锯齿噪点靠下面的
+  // 色差（≥80）和白底占比继续过滤。
+  if (light.length < Math.max(2, Math.round(cell.samples.length * 0.03))) return null;
+  // 亮点大多来自白底（描边/头发压在白底上）时不能升格，否则轮廓被掏成白色缺口。
+  if (light.length > 0 && backgroundLight / light.length >= 0.5) return null;
+  if (cell.edgeStrength < 8 && cell.edgeCoherence < 0.5) return null;
+  const rgb = meanColor(light);
+  return colorDistance(rgb, cell.average) >= 80 ? rgb : null;
+}
+
+function directionalDarkFeatureRgb(cell) {
+  if (
+    !cell.average ||
+    cell.samples.length < 6 ||
+    cell.contrast < 14 ||
+    cell.edgeStrength < 7 ||
+    cell.edgeCoherence < 0.48
+  ) {
+    return null;
+  }
+  const averageLuminance = luminance(cell.average);
+  if (averageLuminance < 100) return null;
+  const limit = Math.min(105, averageLuminance - 36);
+  const dark = cell.samples.filter((sample) => luminance(sample) <= limit);
+  const share = dark.length / cell.samples.length;
+  if (share < 0.08 || share > 0.42) return null;
+  if (cell.darkMass && (share > 0.26 || cell.edgeCoherence < 0.62)) return null;
+  // 暗像素贴在厚实暗区（≥3 格）边上：那是暗区啃进浅色格的一角，不是细线。
+  // 细线（描边/睫毛/胡须）1~2 格就重新变亮，升格才能把线补上。
+  if (thickMassFringe(cell)) return null;
+  const rgb = meanColor(dark);
+  return colorDistance(rgb, cell.average) >= 58 ? rgb : null;
+}
+
+/**
+ * 这一格的暗像素是否只是「厚实暗区压过来的一角」。
+ *
+ * 沿每条暗像素占比 ≥40% 的边向外看两格：若碰到「四邻全暗」的内部格，说明那一侧是
+ * 大块暗区（头发、虹膜、深色衣服），这一格只是被啃到的浅色边界，不该整格升格成暗色豆。
+ *
+ * 必须逐侧检查而不是只看最暗的一侧：斜角楔形的暗区（右下角压进来）会在两侧各占
+ * ~40%，两侧各自的邻格才是真正的暗区内部格，只看占比最大的一侧会漏判。
+ */
+function thickMassFringe(cell) {
+  // 暗像素本身就过半的格子会按主导色上暗色，升不升格结果一致，也不存在歧义。
+  if (cell.darkShare > 0.5) return false;
+  for (let side = 0; side < 4; side += 1) {
+    if (cell.darkEdges[side] < 0.4) continue;
+    let neighbor = cell.darkNeighbors?.[side] || null;
+    for (let step = 0; step < 2 && neighbor; step += 1) {
+      if (neighbor.darkInterior) return true;
+      neighbor = neighbor.darkNeighbors?.[side] || null;
+    }
+  }
+  // 斜角楔形：两条相邻边都暗 ≥40% 时，暗区内部格在对角方向上。
+  for (const [first, second] of DIAGONAL_SIDES) {
+    if (cell.darkEdges[first] < 0.4 || cell.darkEdges[second] < 0.4) continue;
+    if (cell.darkNeighbors?.[first]?.darkNeighbors?.[second]?.darkInterior) return true;
+  }
+  return false;
+}
+
+function shouldDropBackgroundCell(cell, profile) {
+  if (cell.backgroundShare < 0.5) return false;
+  if (cell.backgroundShare >= 0.9) return true;
+  if (cell.backgroundConfidence < 0.18) return false;
+  if (cell.backgroundShare >= profile.backgroundThreshold && cell.backgroundConfidence >= 0.34) return true;
+  return cell.backgroundShare >= 0.62 && cell.backgroundConfidence >= 0.58;
 }
 
 /**
@@ -885,9 +1449,18 @@ function cellTargetColor(cell, profile) {
  * 浅底”判断会把整格当成背景删掉（lineart 的黑线就是这么断的）。所以把被剔除的背景均值
  * 传进来：前景整体偏深、且与背景对比足够大时，前景本身就是那条线。
  */
-function minorityDarkFeatureRgb(samples, edge, backgroundRgb, deepFeatureRgb) {
+function minorityDarkFeatureRgb(cell, profile) {
+  const { samples, edge, backgroundRgb, deepFeatureRgb, darkMass, contrast, edgeCoherence, darkShare } = cell;
   // 去背景的全像素扫描已经确认“这一格确有明显更暗的细线/描边”，优先级最高。
-  if (deepFeatureRgb) return deepFeatureRgb;
+  // 但如果暗像素只是厚实暗区（虹膜、头发）压过来的一角，就不是细线，交给主导色处理，
+  // 否则眼白/高光会被整格涂黑。
+  if (deepFeatureRgb) return thickMassFringe(cell) ? null : deepFeatureRgb;
+  // 保留背景时，暗色升格只对“穿过格子的细线”成立。暗像素是大块暗区（头发、深衣、
+  // 深色背景）压到格子边缘时整格上暗色会凭空多出一颗黑豆，和原图明显对不上，直接放弃。
+  // 卡通模式改用更精确的「厚实暗区压边」判据：只有贴边方向两格内真有「四邻全暗」的
+  // 内部格（暗区厚 ≥3 格）才放弃升格。48 格宽下描边只有 0.3 格厚，却常紧贴头发，
+  // 旧的粗判据会把整段轮廓排成背景色，描边在一整排格子上消失。
+  if (darkMass && (!profile || profile.dither !== 'none' || thickMassFringe(cell))) return null;
   if (samples.length < 4) return null;
   const buckets = new Map();
   for (const sample of samples) {
@@ -907,7 +1480,22 @@ function minorityDarkFeatureRgb(samples, edge, backgroundRgb, deepFeatureRgb) {
   const primaryLuminance = luminance(primary.rgb);
 
   if (primaryLuminance < 150) {
-    if (!backgroundRgb) return null;
+    if (!backgroundRgb) {
+      // 中等明度的皮肤、衣物或虚化背景上也可能有眼睛、嘴和细描边。只有方向明确、
+      // 对比足够且暗部占比不是零星噪点时才升格，避免少量暗像素把浅色格涂黑。
+      if (!edge || contrast < 20 || edgeCoherence < 0.56 || darkShare < 0.1 || darkShare > 0.42) return null;
+      const minShare = edgeCoherence >= 0.68 ? 0.1 : 0.14;
+      let candidate = null;
+      for (const row of rows.slice(1)) {
+        const share = row.count / samples.length;
+        const featureLuminance = luminance(row.rgb);
+        if (share < minShare || featureLuminance > 92) continue;
+        if (featureLuminance + 52 > primaryLuminance) continue;
+        if (colorDistance(row.rgb, primary.rgb) < 68) continue;
+        if (!candidate || row.count > candidate.count) candidate = row;
+      }
+      return candidate?.rgb || null;
+    }
     // 背景被剔除后的“整格只有描边”分支：前景是深色、背景是浅色、且差异明显才保留。
     const backgroundLuminance = luminance(backgroundRgb);
     if (primaryLuminance > 90) return null;
@@ -932,7 +1520,7 @@ function minorityDarkFeatureRgb(samples, edge, backgroundRgb, deepFeatureRgb) {
   return best ? best.rgb : null;
 }
 
-function dominantClusterColor(samples) {
+function dominantCluster(samples) {
   if (samples.length < 6) return null;
   const average = meanColor(samples);
   let seedA = samples[0];
@@ -969,8 +1557,18 @@ function dominantClusterColor(samples) {
     seedB = meanColor(groupB);
   }
   const dominant = groupA.length >= groupB.length ? groupA : groupB;
-  if (dominant.length / samples.length < 0.32) return null;
-  return meanColor(dominant);
+  const share = dominant.length / samples.length;
+  if (share < 0.32) return null;
+  return { rgb: meanColor(dominant), share, separation };
+}
+
+function mixRgb(a, b, weight) {
+  const inverse = 1 - weight;
+  return [
+    Math.round(a[0] * inverse + b[0] * weight),
+    Math.round(a[1] * inverse + b[1] * weight),
+    Math.round(a[2] * inverse + b[2] * weight),
+  ];
 }
 
 function meanColor(samples) {
@@ -985,7 +1583,7 @@ function meanColor(samples) {
   return [Math.round(r / samples.length), Math.round(g / samples.length), Math.round(b / samples.length)];
 }
 
-function reduceSpeckles(cells, width, height, strength, candidates, protectedCells) {
+function reduceSpeckles(cells, width, height, strength, candidates, sampled) {
   const iterations = Math.max(0, Math.min(4, Math.round(strength)));
   if (iterations === 0) return cells;
   const colorMap = new Map(candidates.map((color) => [color.id, color]));
@@ -998,13 +1596,20 @@ function reduceSpeckles(cells, width, height, strength, candidates, protectedCel
         const index = y * width + x;
         const colorId = current[index];
         if (!colorId) continue;
-        // 边缘格不参与“去孤立豆”，否则描边会被抹成背景色。
-        if (protectedCells && protectedCells[index]) continue;
+        if (protectDetailCell(sampled, current, index, width, height, colorMap)) continue;
         const neighbors = neighborColorIds(current, width, height, x, y);
         const sameCount = neighbors.filter((item) => item === colorId).length;
         const majority = majorityColor(neighbors);
         if (!majority.colorId) continue;
-        if (!areSimilarColors(colorMap.get(colorId), colorMap.get(majority.colorId), strength, false)) continue;
+        const fromColor = colorMap.get(colorId);
+        const toColor = colorMap.get(majority.colorId);
+        const isolatedMatch =
+          sameCount === 0 &&
+          majority.count >= 5 &&
+          fromColor &&
+          toColor &&
+          colorDistanceLab(fromColor.rgb, toColor.rgb) <= 8;
+        if (!isolatedMatch && !areSimilarColors(fromColor, toColor, strength, false)) continue;
         const requiredMajority = iterations >= 4 ? (pass === 0 ? 3 : 4) : pass === 0 ? 4 : 5;
         const sameLimit = iterations >= 4 ? (pass === 0 ? 2 : 1) : pass === 0 ? 1 : 0;
         if (sameCount <= sameLimit && majority.count >= requiredMajority) next[index] = majority.colorId;
@@ -1014,12 +1619,54 @@ function reduceSpeckles(cells, width, height, strength, candidates, protectedCel
   return next;
 }
 
-function reduceTinyRegions(cells, width, height, strength, candidates, protectedCells) {
+function reduceTinyRegions(cells, width, height, strength, candidates, sampled) {
   const level = Math.max(0, Math.min(4, Math.round(strength)));
   const maxRegionSize = [0, 1, 2, 5, 9][level];
   if (maxRegionSize <= 0) return cells;
   const colorMap = new Map(candidates.map((color) => [color.id, color]));
   const next = cells.slice();
+  // 1 级清理只处理「一格宽」的孤立块（照片里绝大多数是这种）。逐格看四邻域就够，
+  // 不必为每个格子开 BFS 队列 + Map：12k 格时这一步能省掉一半清理耗时。
+  if (maxRegionSize === 1) {
+    const offsets = [[1, 0], [-1, 0], [0, 1], [0, -1]];
+    for (let y = 0; y < height; y += 1) {
+      for (let x = 0; x < width; x += 1) {
+        const index = y * width + x;
+        const colorId = cells[index];
+        if (!colorId) continue;
+        let sameNeighbor = false;
+        const borders = [];
+        for (const [dx, dy] of offsets) {
+          const nx = x + dx;
+          const ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+          const neighborColorId = cells[ny * width + nx];
+          if (!neighborColorId) continue;
+          if (neighborColorId === colorId) {
+            sameNeighbor = true;
+            break;
+          }
+          const row = borders.find((item) => item.colorId === neighborColorId);
+          if (row) row.count += 1;
+          else borders.push({ colorId: neighborColorId, count: 1 });
+        }
+        if (sameNeighbor || borders.length === 0) continue;
+        if (protectDetailCell(sampled, cells, index, width, height, colorMap)) continue;
+        const from = colorMap.get(colorId);
+        if (!from) continue;
+        const replacement = borders
+          .sort((a, b) => b.count - a.count)
+          .find(({ colorId: neighborColorId, count }) => {
+            const to = colorMap.get(neighborColorId);
+            if (!to) return false;
+            if (count >= 3 && colorDistanceLab(from.rgb, to.rgb) <= 8) return true;
+            return areSimilarColors(from, to, strength, true);
+          });
+        if (replacement) next[index] = replacement.colorId;
+      }
+    }
+    return next;
+  }
   const visited = new Uint8Array(cells.length);
   const offsets = [[1, 0], [-1, 0], [0, 1], [0, -1]];
 
@@ -1054,10 +1701,29 @@ function reduceTinyRegions(cells, width, height, strength, candidates, protected
     }
 
     if (region.length > maxRegionSize || borderCounts.size === 0) continue;
-    if (protectedCells && region.some((index) => protectedCells[index])) continue;
+    const xs = region.map((index) => index % width);
+    const ys = region.map((index) => Math.floor(index / width));
+    const regionWidth = Math.max(...xs) - Math.min(...xs) + 1;
+    const regionHeight = Math.max(...ys) - Math.min(...ys) + 1;
+    const lineLike =
+      region.length >= 2 &&
+      Math.max(regionWidth, regionHeight) >= 2 &&
+      Math.min(regionWidth, regionHeight) <= 2;
+    if (
+      region.some((index) => protectDetailCell(sampled, cells, index, width, height, colorMap)) &&
+      (lineLike || region.length === 1)
+    ) {
+      continue;
+    }
     const replacement = [...borderCounts.entries()]
       .sort((a, b) => b[1] - a[1])
-      .find(([neighborColorId]) => areSimilarColors(colorMap.get(colorId), colorMap.get(neighborColorId), strength, true))?.[0];
+      .find(([neighborColorId, border]) => {
+        const from = colorMap.get(colorId);
+        const to = colorMap.get(neighborColorId);
+        if (!from || !to) return false;
+        if (region.length === 1 && border >= 3 && colorDistanceLab(from.rgb, to.rgb) <= 8) return true;
+        return areSimilarColors(from, to, strength, true);
+      })?.[0];
     if (!replacement) continue;
     region.forEach((index) => {
       next[index] = replacement;
@@ -1066,7 +1732,7 @@ function reduceTinyRegions(cells, width, height, strength, candidates, protected
   return next;
 }
 
-function mergeSimilarColors(cells, strength, candidates) {
+function mergeSimilarColors(cells, width, height, strength, candidates, sampled) {
   const level = Math.max(0, Math.min(4, Math.round(strength)));
   if (level === 0) return cells;
   const colorMap = new Map(candidates.map((color) => [color.id, color]));
@@ -1082,11 +1748,55 @@ function mergeSimilarColors(cells, strength, candidates) {
     })
     .sort((a, b) => b.count - a.count);
   const total = rows.reduce((sum, row) => sum + row.count, 0);
+  const protectedCounts = new Map();
+  const edgeCounts = new Map();
+  for (let i = 0; i < cells.length; i += 1) {
+    const colorId = cells[i];
+    if (!colorId) continue;
+    if (sampled[i]?.edge) edgeCounts.set(colorId, (edgeCounts.get(colorId) || 0) + 1);
+    if (isStrongDetail(sampled[i])) {
+      protectedCounts.set(colorId, (protectedCounts.get(colorId) || 0) + 1);
+    }
+  }
+  const adjacency = new Map();
+  const connect = (from, to) => {
+    if (!from || !to || from === to) return;
+    let row = adjacency.get(from);
+    if (!row) {
+      row = new Map();
+      adjacency.set(from, row);
+    }
+    row.set(to, (row.get(to) || 0) + 1);
+  };
+  for (let y = 0; y < height; y += 1) {
+    for (let x = 0; x < width; x += 1) {
+      const index = y * width + x;
+      const own = cells[index];
+      if (x + 1 < width) {
+        const right = cells[index + 1];
+        connect(own, right);
+        connect(right, own);
+      }
+      if (y + 1 < height) {
+        const bottom = cells[index + width];
+        connect(own, bottom);
+        connect(bottom, own);
+      }
+    }
+  }
   const replacements = new Map();
 
   rows.forEach((row, index) => {
     const rare = row.count <= Math.max(3, total * (0.006 + level * 0.003));
-    const target = rows.slice(0, index).find((candidate) => areSimilarColors(row.color, candidate.color, level, rare));
+    if ((protectedCounts.get(row.colorId) || 0) / row.count >= 0.12) return;
+    if ((edgeCounts.get(row.colorId) || 0) / row.count >= 0.2) return;
+    const neighbors = adjacency.get(row.colorId);
+    if (!neighbors) return;
+    const target = rows
+      .slice(0, index)
+      .filter((candidate) => neighbors.has(candidate.colorId))
+      .filter((candidate) => areSimilarColors(row.color, candidate.color, level, true))
+      .sort((a, b) => (neighbors.get(b.colorId) || 0) - (neighbors.get(a.colorId) || 0))[0];
     if (target) replacements.set(row.colorId, replacements.get(target.colorId) || target.colorId);
   });
 
@@ -1097,24 +1807,65 @@ function mergeSimilarColors(cells, strength, candidates) {
 function areSimilarColors(from, to, strength, rare) {
   if (!from || !to || from.id === to.id) return false;
   const level = Math.max(0, Math.min(4, Math.round(strength)));
-  const baseThreshold = [0, 26, 42, 62, 84][level];
+  const baseThreshold = [0, 2.6, 4.2, 5.8, 7.5][level];
   if (baseThreshold <= 0) return false;
   const fromChroma = colorChroma(from.rgb);
   const toChroma = colorChroma(to.rgb);
   const fromLuminance = luminance(from.rgb);
   const toLuminance = luminance(to.rgb);
-  const distance = colorDistance(from.rgb, to.rgb);
+  const distance = colorDistanceLab(from.rgb, to.rgb);
   const saturationMismatch = Math.abs(fromChroma - toChroma);
   const luminanceMismatch = Math.abs(fromLuminance - toLuminance);
   const bothDark = fromLuminance < 84 && toLuminance < 84;
   const bothLightNeutral = fromLuminance > 188 && toLuminance > 188 && fromChroma < 46 && toChroma < 46;
   const bothMuted = fromLuminance > 96 && toLuminance > 96 && fromChroma < 82 && toChroma < 82;
-  let threshold = baseThreshold * (rare ? 1.45 : 1);
-  if (bothDark || bothLightNeutral || bothMuted) threshold *= 1.15;
-  if (fromChroma > 78 || toChroma > 78) threshold *= 0.7;
-  if (saturationMismatch > 56) threshold *= 0.58;
-  if (luminanceMismatch > 86 && !bothDark) threshold *= 0.55;
+  let threshold = baseThreshold * (rare ? 1.25 : 1);
+  if (bothLightNeutral) threshold *= 1.55;
+  else if (bothDark || bothMuted) threshold *= 1.12;
+  if (fromChroma > 78 || toChroma > 78) threshold *= 0.78;
+  if (saturationMismatch > 56) threshold *= 0.62;
+  if (luminanceMismatch > 64 && !bothDark) threshold *= 0.5;
   return distance <= threshold;
+}
+
+function isStrongDetail(cell) {
+  return Boolean(cell?.deepFeatureRgb) || (cell?.featureStrength || 0) >= 0.78;
+}
+
+function protectDetailCell(sampled, cells, index, width, height, colorMap) {
+  const cell = sampled?.[index];
+  if (!cell) return false;
+  if (isStrongDetail(cell)) return true;
+  if (!cell.edge || cell.edgeCoherence < 0.55) return false;
+  const colorId = cells[index];
+  const color = colorMap.get(colorId);
+  if (!color) return false;
+  const x = index % width;
+  const y = Math.floor(index / width);
+  const offsets = cell.edgeDirection === 'vertical' ? [[0, -1], [0, 1]] : [[-1, 0], [1, 0]];
+  for (const [dx, dy] of offsets) {
+    const nx = x + dx;
+    const ny = y + dy;
+    if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+    const neighborId = cells[ny * width + nx];
+    if (!neighborId) continue;
+    if (neighborId === colorId) return true;
+    const neighbor = colorMap.get(neighborId);
+    if (neighbor && colorDistanceLab(color.rgb, neighbor.rgb) <= 4.2) return true;
+  }
+  // 曲线和小字会在相邻格改变方向；只要 8 邻域里还有同色的高信息格，就视为连续线段。
+  for (let dy = -1; dy <= 1; dy += 1) {
+    for (let dx = -1; dx <= 1; dx += 1) {
+      if (dx === 0 && dy === 0) continue;
+      const nx = x + dx;
+      const ny = y + dy;
+      if (nx < 0 || ny < 0 || nx >= width || ny >= height) continue;
+      const neighborIndex = ny * width + nx;
+      if (!sampled[neighborIndex]?.edge) continue;
+      if (cells[neighborIndex] === colorId) return true;
+    }
+  }
+  return false;
 }
 
 function neighborColorIds(cells, width, height, x, y) {
@@ -1147,33 +1898,37 @@ function majorityColor(colors) {
  * 这样即使主体内部有和背景同色的区域（白衬衫、反光、同色高光），也不会被挖空。
  * 返回 Uint8Array(width*height)，1 = 背景。
  */
-function buildBackgroundMask(source, centers) {
+function buildBackgroundModel(source, centers) {
   const { data, width, height } = source;
   const mask = new Uint8Array(width * height);
-  if (!centers || centers.length === 0) return mask;
+  const confidence = new Float32Array(width * height);
+  if (!centers || centers.length === 0) return { mask, confidence };
   const queue = new Int32Array(width * height);
   let head = 0;
   let tail = 0;
   const seed = (index) => {
     if (mask[index]) return;
     const offset = index * 4;
+    let pixelConfidence = 1;
     if (data[offset + 3] >= 24) {
       const r = data[offset];
       const g = data[offset + 1];
       const b = data[offset + 2];
+      pixelConfidence = 0;
       let matched = false;
       for (const center of centers) {
         const dr = r - center.rgb[0];
         const dg = g - center.rgb[1];
         const db = b - center.rgb[2];
-        if (dr * dr + dg * dg + db * db <= center.tolerance * center.tolerance) {
-          matched = true;
-          break;
-        }
+        const distance = Math.sqrt(dr * dr + dg * dg + db * db);
+        if (distance > center.tolerance) continue;
+        matched = true;
+        pixelConfidence = Math.max(pixelConfidence, 1 - distance / center.tolerance);
       }
       if (!matched) return;
     }
     mask[index] = 1;
+    confidence[index] = Math.max(0.04, pixelConfidence);
     queue[tail] = index;
     tail += 1;
   };
@@ -1196,7 +1951,7 @@ function buildBackgroundMask(source, centers) {
     if (y > 0) seed(index - width);
     if (y < height - 1) seed(index + width);
   }
-  return dilateMask(mask, width, height);
+  return growBackgroundModel(source, centers, mask, confidence);
 }
 
 /**
@@ -1204,8 +1959,10 @@ function buildBackgroundMask(source, centers) {
  * 既不像背景也不像主体，留着会在轮廓外侧染出一圈脏蓝边。
  * 只扩 1 像素，主体内部由描边挡住，不会被蚕食。
  */
-function dilateMask(mask, width, height) {
+function growBackgroundModel(source, centers, mask, confidence) {
+  const { data, width, height } = source;
   const grown = new Uint8Array(mask);
+  const grownConfidence = new Float32Array(confidence);
   for (let y = 0; y < height; y += 1) {
     for (let x = 0; x < width; x += 1) {
       const index = y * width + x;
@@ -1214,17 +1971,32 @@ function dilateMask(mask, width, height) {
       const bottom = y < height - 1;
       const left = x > 0;
       const right = x < width - 1;
-      if (left) grown[index - 1] = 1;
-      if (right) grown[index + 1] = 1;
-      if (top) grown[index - width] = 1;
-      if (bottom) grown[index + width] = 1;
-      if (top && left) grown[index - width - 1] = 1;
-      if (top && right) grown[index - width + 1] = 1;
-      if (bottom && left) grown[index + width - 1] = 1;
-      if (bottom && right) grown[index + width + 1] = 1;
+      const neighbors = [];
+      if (left) neighbors.push(index - 1);
+      if (right) neighbors.push(index + 1);
+      if (top) neighbors.push(index - width);
+      if (bottom) neighbors.push(index + width);
+      if (top && left) neighbors.push(index - width - 1);
+      if (top && right) neighbors.push(index - width + 1);
+      if (bottom && left) neighbors.push(index + width - 1);
+      if (bottom && right) neighbors.push(index + width + 1);
+      for (const neighbor of neighbors) {
+        if (mask[neighbor] || grown[neighbor]) continue;
+        const offset = neighbor * 4;
+        if (data[offset + 3] < 24) {
+          grown[neighbor] = 1;
+          grownConfidence[neighbor] = 1;
+          continue;
+        }
+        const rgb = [data[offset], data[offset + 1], data[offset + 2]];
+        const affinity = backgroundAffinity(rgb, centers, 1.18);
+        grown[neighbor] = 1;
+        // 扩张像素天然处在主体边界，置信度压低；格级决策会优先保留这类区域。
+        grownConfidence[neighbor] = Math.max(0.04, affinity * 0.35);
+      }
     }
   }
-  return grown;
+  return { mask: grown, confidence: grownConfidence };
 }
 
 function luminance(rgb) {
@@ -1233,6 +2005,19 @@ function luminance(rgb) {
 
 function colorChroma(rgb) {
   return Math.max(...rgb) - Math.min(...rgb);
+}
+
+function backgroundAffinity(rgb, centers, toleranceScale = 1.7) {
+  if (!rgb || !centers || centers.length === 0) return 0;
+  let confidence = 0;
+  for (const center of centers) {
+    const dr = rgb[0] - center.rgb[0];
+    const dg = rgb[1] - center.rgb[1];
+    const db = rgb[2] - center.rgb[2];
+    const distance = Math.sqrt(dr * dr + dg * dg + db * db);
+    confidence = Math.max(confidence, 1 - distance / Math.max(1, center.tolerance * toleranceScale));
+  }
+  return clampValue(confidence, 0, 1);
 }
 
 // 采样阶段每个像素都要做一次 sRGB→线性光换算，查表比逐次 pow 快得多（结果完全一致）。

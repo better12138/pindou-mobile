@@ -18,13 +18,20 @@ export function computeFit(viewWidth, viewHeight, gridWidth, gridHeight) {
   };
 }
 
+const LONG_PRESS_MS = 420;
+const TAP_SLOP = 8;
+const DOUBLE_TAP_MS = 320;
+
 export class BoardViewer {
-  constructor(canvas, { onTapCell, onViewChange, onStroke } = {}) {
+  constructor(canvas, { onTapCell, onViewChange, onStroke, onLongPressStart, onLongPressMove, onLongPressEnd } = {}) {
     this.canvas = canvas;
     this.context = canvas.getContext('2d');
     this.onTapCell = onTapCell || (() => {});
     this.onViewChange = onViewChange || (() => {});
     this.onStroke = onStroke || (() => {});
+    this.onLongPressStart = onLongPressStart || (() => {});
+    this.onLongPressMove = onLongPressMove || (() => {});
+    this.onLongPressEnd = onLongPressEnd || (() => {});
     this.project = null;
     this.scale = 1;
     this.tx = 0;
@@ -32,6 +39,11 @@ export class BoardViewer {
     this.filter = null;
     this.options = { showGrid: true, showCodes: false, beadStyle: true };
     this.compare = null;
+    // 画笔态的局部提示：当前工具、当前色、落笔焦点。
+    this.editTool = 'view';
+    this.paintColor = null;
+    this.focus = null;
+    this.focusTimer = 0;
     this.pointers = new Map();
     this.pinch = null;
     this.pan = null;
@@ -39,6 +51,14 @@ export class BoardViewer {
     this.frame = 0;
     this.painting = false;
     this.strokeIndex = -1;
+    // 长按手势：按下后先不落笔，超过阈值才算笔画，避免「长按吸色」先误涂一格。
+    this.pending = null;
+    this.longPressTimer = 0;
+    this.tempPick = false;
+    this.tempPickIndex = -1;
+    this.lastTap = null;
+    // 双指手势结束后，剩下的一根手指不应该继续涂色。
+    this.suppressGesture = false;
     this.bind();
     this.observeResize();
   }
@@ -46,7 +66,41 @@ export class BoardViewer {
   /** 编辑工具激活时，单指点按/拖动直接落在格子上；双指仍用于缩放拖动。 */
   setPainting(active) {
     this.painting = Boolean(active);
-    if (!this.painting) this.strokeIndex = -1;
+    if (!this.painting) {
+      this.strokeIndex = -1;
+      this.clearPending();
+    }
+  }
+
+  clearPending() {
+    if (this.longPressTimer) clearTimeout(this.longPressTimer);
+    this.longPressTimer = 0;
+    this.pending = null;
+  }
+
+  /** 按下后记录起点并启动长按计时；移动超过阈值或抬起时取消。 */
+  startPending(point) {
+    const index = this.cellFromLocal(point);
+    if (index === null) return;
+    this.clearPending();
+    this.pending = { index, point, moved: false, painted: false };
+    this.longPressTimer = setTimeout(() => this.fireLongPress(), LONG_PRESS_MS);
+  }
+
+  fireLongPress() {
+    this.longPressTimer = 0;
+    const pending = this.pending;
+    if (!pending || this.pointers.size !== 1 || this.pinch) return;
+    this.pending = null;
+    this.pan = null;
+    this.tempPick = true;
+    this.tempPickIndex = pending.index;
+    this.onLongPressStart(pending.index);
+  }
+
+  beginStrokeAt(index) {
+    this.strokeIndex = index;
+    this.onStroke('start', index);
   }
 
   setProject(project) {
@@ -61,6 +115,46 @@ export class BoardViewer {
 
   setFilter(colorId) {
     this.filter = colorId || null;
+    this.dirty = true;
+  }
+
+  /** 画笔态只用局部提示，不再对整图做全局压暗/降饱和。 */
+  setEditTool(tool) {
+    this.editTool = tool || 'view';
+    if (this.editTool === 'view' && !this.painting) this.clearFocus();
+    this.dirty = true;
+  }
+
+  setPaintColor(colorId) {
+    this.paintColor = colorId || null;
+    this.dirty = true;
+  }
+
+  keepFocus(index) {
+    if (index === null || index === undefined) return;
+    const project = this.project;
+    if (!project) return;
+    this.focus = { x: index % project.width, y: Math.floor(index / project.width) };
+    if (this.focusTimer) clearTimeout(this.focusTimer);
+    this.focusTimer = 0;
+    this.dirty = true;
+  }
+
+  /** 松手后保留一小段时间，让最后一格的光标位置可被看到。 */
+  dropFocusSoon() {
+    if (!this.focus) return;
+    if (this.focusTimer) clearTimeout(this.focusTimer);
+    this.focusTimer = setTimeout(() => {
+      this.focus = null;
+      this.focusTimer = 0;
+      this.dirty = true;
+    }, 260);
+  }
+
+  clearFocus() {
+    if (this.focusTimer) clearTimeout(this.focusTimer);
+    this.focusTimer = 0;
+    this.focus = null;
     this.dirty = true;
   }
 
@@ -144,21 +238,35 @@ export class BoardViewer {
       }
       const point = localPoint(event);
       this.pointers.set(event.pointerId, point);
-      if (this.pointers.size === 2 && this.strokeIndex >= 0) {
-        // 第二根手指落下：结束当前笔画，把手势交还给缩放/拖动，避免误画。
-        this.strokeIndex = -1;
-        this.onStroke('end');
+
+      // 第二根手指落下：临时吸管立即结束，正在画的笔画收尾，手势交还给缩放/拖动。
+      if (this.tempPick) {
+        this.tempPick = false;
+        this.tempPickIndex = -1;
+        this.onLongPressEnd();
       }
+      if (this.pointers.size === 2) {
+        this.clearPending();
+        if (this.strokeIndex >= 0) {
+          this.strokeIndex = -1;
+          this.onStroke('end');
+        }
+      }
+
       if (this.pointers.size === 1) {
+        this.pinch = null;
         if (this.painting) {
           this.pan = null;
-          this.pinch = null;
-          this.beginStroke(point);
+          this.startPending(point);
+          this.keepFocus(this.cellFromLocal(point));
           return;
         }
         this.pan = { x: point.x, y: point.y, tx: this.tx, ty: this.ty, moved: false, at: Date.now() };
-        this.pinch = null;
+        // 浏览模式也能长按临时吸管。
+        this.startPending(point);
       } else if (this.pointers.size === 2) {
+        this.suppressGesture = true;
+        this.clearFocus();
         const [a, b] = [...this.pointers.values()];
         this.pinch = {
           distance: Math.hypot(a.x - b.x, a.y - b.y),
@@ -177,9 +285,50 @@ export class BoardViewer {
       const pointer = localPoint(event);
       this.pointers.set(event.pointerId, pointer);
 
-      if (this.painting && this.pointers.size === 1) {
+      // 长按临时吸管：按住移动时连续取色。
+      if (this.tempPick) {
         const index = this.cellFromLocal(pointer);
-        if (index !== null && index !== this.strokeIndex) {
+        if (index !== null) this.keepFocus(index);
+        if (index !== null && index !== this.tempPickIndex) {
+          this.tempPickIndex = index;
+          this.onLongPressMove(index);
+        }
+        return;
+      }
+
+      // 手指一旦移动超过阈值就取消长按，避免正常涂色被误判。
+      if (this.pending && Math.abs(pointer.x - this.pending.point.x) + Math.abs(pointer.y - this.pending.point.y) > TAP_SLOP) {
+        this.pending.moved = true;
+        if (this.longPressTimer) clearTimeout(this.longPressTimer);
+        this.longPressTimer = 0;
+      }
+
+      if (this.painting && this.pointers.size === 1) {
+        if (this.suppressGesture) return;
+        const index = this.cellFromLocal(pointer);
+        if (index === null) return;
+        this.keepFocus(index);
+        if (!this.pending) {
+          // 起手在格子外、移动进格子：从当前格开始画。
+          if (this.strokeIndex < 0) this.beginStrokeAt(index);
+          else if (index !== this.strokeIndex) {
+            this.strokeIndex = index;
+            this.onStroke('move', index);
+          }
+          return;
+        }
+        if (!this.pending.painted) {
+          // 第一次移动才真正落笔，先补上起点格。
+          this.pending.painted = true;
+          const start = this.pending.index;
+          this.beginStrokeAt(start);
+          if (index !== start) {
+            this.strokeIndex = index;
+            this.onStroke('move', index);
+          }
+          return;
+        }
+        if (index !== this.strokeIndex) {
           this.strokeIndex = index;
           this.onStroke('move', index);
         }
@@ -209,6 +358,7 @@ export class BoardViewer {
         if (Math.abs(dx) + Math.abs(dy) > 6) {
           this.pan.moved = true;
           this.userAdjusted = true;
+          this.lastTap = null;
         }
         this.tx = this.pan.tx + dx;
         this.ty = this.pan.ty + dy;
@@ -220,18 +370,68 @@ export class BoardViewer {
       const pointer = this.pointers.get(event.pointerId);
       this.pointers.delete(event.pointerId);
       if (this.pointers.size < 2) this.pinch = null;
+
+      // 临时吸管：松手回到原工具，不落笔也不触发点按。
+      if (this.tempPick) {
+        this.tempPick = false;
+        this.tempPickIndex = -1;
+        this.clearPending();
+        this.pan = null;
+        if (this.pointers.size === 1) {
+          const [remaining] = [...this.pointers.values()];
+          this.pan = { x: remaining.x, y: remaining.y, tx: this.tx, ty: this.ty, moved: true, at: Date.now() };
+        }
+        this.onLongPressEnd();
+        this.dropFocusSoon();
+        return;
+      }
+
+      // 单指抬起的点按：延迟到抬手才落笔，长按已经提前接管。
+      if (this.pointers.size === 0 && this.pending) {
+        const pending = this.pending;
+        this.clearPending();
+        if (this.painting) {
+          if (!pending.painted) {
+            this.beginStrokeAt(pending.index);
+            this.strokeIndex = -1;
+            this.onStroke('end');
+          } else if (this.strokeIndex >= 0) {
+            this.strokeIndex = -1;
+            this.onStroke('end');
+          }
+          this.pan = null;
+          this.dropFocusSoon();
+          return;
+        }
+      }
+
       if (this.pointers.size === 0 && this.strokeIndex >= 0) {
         this.strokeIndex = -1;
         this.pan = null;
         this.onStroke('end');
+        this.dropFocusSoon();
         return;
       }
+
       if (this.pointers.size === 0 && this.pan && pointer && !this.pan.moved && Date.now() - this.pan.at < 450) {
         this.lastPointerTap = Date.now();
-        this.handleTap(event.clientX, event.clientY);
+        const now = Date.now();
+        const last = this.lastTap;
+        const isDouble =
+          last && now - last.time < DOUBLE_TAP_MS && Math.hypot(pointer.x - last.x, pointer.y - last.y) < 30;
+        if (isDouble) {
+          this.lastTap = null;
+          // 双击放大；已经接近最大倍率时回到适应屏幕。
+          if (this.scale >= MAX_SCALE * 0.9) this.fit();
+          else this.zoomAt(2, pointer.x, pointer.y);
+        } else {
+          this.lastTap = { time: now, x: pointer.x, y: pointer.y };
+          this.handleTap(pointer.x + canvas.getBoundingClientRect().left, pointer.y + canvas.getBoundingClientRect().top);
+        }
       }
       if (this.pointers.size === 0) {
         this.pan = null;
+        this.suppressGesture = false;
       } else if (this.pointers.size === 1) {
         const [remaining] = [...this.pointers.values()];
         this.pan = { x: remaining.x, y: remaining.y, tx: this.tx, ty: this.ty, moved: true, at: Date.now() };
@@ -263,13 +463,6 @@ export class BoardViewer {
     const y = Math.floor((point.y - this.ty) / this.scale);
     if (x < 0 || y < 0 || x >= this.project.width || y >= this.project.height) return null;
     return y * this.project.width + x;
-  }
-
-  beginStroke(point) {
-    const index = this.cellFromLocal(point);
-    if (index === null) return;
-    this.strokeIndex = index;
-    this.onStroke('start', index);
   }
 
   handleTap(clientX, clientY) {
@@ -385,9 +578,9 @@ export class BoardViewer {
           } else {
             ctx.fillRect(px, py, Math.ceil(cell), Math.ceil(cell));
           }
-          if (cell >= 15) {
-            ctx.strokeStyle = '#27795a';
-            ctx.lineWidth = Math.max(1.2, cell * 0.08);
+          if (cell >= 8) {
+            ctx.strokeStyle = '#1f6b4e';
+            ctx.lineWidth = Math.max(1, cell * 0.1);
             ctx.beginPath();
             ctx.moveTo(px + cell * 0.28, py + cell * 0.52);
             ctx.lineTo(px + cell * 0.44, py + cell * 0.68);
@@ -447,7 +640,118 @@ export class BoardViewer {
       ctx.stroke();
     }
 
+    // 只在当前色数量不占多数时做轻描边，避免给背景色描出一整张网。
+    this.drawPaintOutline(ctx, project, startX, startY, endX, endY);
+    this.drawFocus(ctx, project);
+
     this.drawCompare(ctx, project, width, height);
+  }
+
+  /** 当前画笔色的轻微外描边：局部提示，不改动任何格子的填充色。 */
+  drawPaintOutline(ctx, project, startX, startY, endX, endY) {
+    if (this.editTool !== 'brush' && this.editTool !== 'bucket') return;
+    if (!this.paintColor || this.scale < 6) return;
+    let total = 0;
+    let match = 0;
+    for (const id of project.cells) {
+      if (!id) continue;
+      total += 1;
+      if (id === this.paintColor) match += 1;
+    }
+    // 背景色往往占一半以上，全部描边会变成噪声；只给「少数色」做定位。
+    if (!match || !total || match / total > 0.45) return;
+    const color = getColor(this.paintColor);
+    if (!color) return;
+    const cell = this.scale;
+    const light = 0.299 * color.rgb[0] + 0.587 * color.rgb[1] + 0.114 * color.rgb[2] > 160;
+    ctx.save();
+    ctx.globalAlpha = 1;
+    ctx.strokeStyle = light ? 'rgba(92,64,74,0.35)' : 'rgba(255,255,255,0.52)';
+    ctx.lineWidth = Math.max(1, cell * 0.08);
+    for (let y = startY; y < endY; y += 1) {
+      for (let x = startX; x < endX; x += 1) {
+        if (project.cells[y * project.width + x] !== this.paintColor) continue;
+        const cx = this.tx + (x + 0.5) * cell;
+        const cy = this.ty + (y + 0.5) * cell;
+        ctx.beginPath();
+        ctx.arc(cx, cy, cell * 0.44 + Math.max(0.7, cell * 0.05), 0, Math.PI * 2);
+        ctx.stroke();
+      }
+    }
+    ctx.restore();
+  }
+
+  /** 落笔焦点：5×5 范围内网格提亮 + 外框 + 当前格圆环。 */
+  drawFocus(ctx, project) {
+    const focus = this.focus;
+    if (!focus) return;
+    const cell = this.scale;
+    if (cell < 4) return;
+    // 填充是点区域，不需要 5×5 的笔刷范围；只标出种子格。
+    const span = this.editTool === 'bucket' ? 0 : 2;
+    const x0 = Math.max(0, focus.x - span);
+    const x1 = Math.min(project.width, focus.x + span + 1);
+    const y0 = Math.max(0, focus.y - span);
+    const y1 = Math.min(project.height, focus.y + span + 1);
+    const left = this.tx + x0 * cell;
+    const top = this.ty + y0 * cell;
+    const w = (x1 - x0) * cell;
+    const h = (y1 - y0) * cell;
+    const accent =
+      this.editTool === 'eraser'
+        ? 'rgba(92,64,74,0.75)'
+        : this.editTool === 'mark'
+          ? 'rgba(31,107,78,0.82)'
+          : 'rgba(201,58,110,0.78)';
+
+    ctx.save();
+    ctx.globalAlpha = 1;
+
+    if (this.options.showGrid && cell >= 6) {
+      // 先铺一层暖白，再压一层细的玫瑰色，深色/浅色格子上都能看出提亮。
+      ctx.strokeStyle = 'rgba(255,253,251,0.88)';
+      ctx.lineWidth = Math.max(1.6, cell * 0.1);
+      ctx.beginPath();
+      for (let x = x0; x <= x1; x += 1) {
+        const px = Math.round(this.tx + x * cell) + 0.5;
+        ctx.moveTo(px, top);
+        ctx.lineTo(px, top + h);
+      }
+      for (let y = y0; y <= y1; y += 1) {
+        const py = Math.round(this.ty + y * cell) + 0.5;
+        ctx.moveTo(left, py);
+        ctx.lineTo(left + w, py);
+      }
+      ctx.stroke();
+      ctx.strokeStyle = 'rgba(201,58,110,0.3)';
+      ctx.lineWidth = 1;
+      ctx.stroke();
+    }
+
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = 2;
+    if (typeof ctx.roundRect === 'function') {
+      ctx.beginPath();
+      ctx.roundRect(left, top, w, h, 8);
+      ctx.stroke();
+    } else {
+      ctx.strokeRect(left, top, w, h);
+    }
+
+    const cx = this.tx + (focus.x + 0.5) * cell;
+    const cy = this.ty + (focus.y + 0.5) * cell;
+    const radius = cell * 0.47;
+    ctx.strokeStyle = 'rgba(255,253,251,0.95)';
+    ctx.lineWidth = Math.max(2, cell * 0.12);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.strokeStyle = accent;
+    ctx.lineWidth = Math.max(1.2, cell * 0.07);
+    ctx.beginPath();
+    ctx.arc(cx, cy, radius, 0, Math.PI * 2);
+    ctx.stroke();
+    ctx.restore();
   }
 
   /** 原图对照层：叠加时半透明盖在图纸上；左右模式左半边显示原图并画分界线。 */
